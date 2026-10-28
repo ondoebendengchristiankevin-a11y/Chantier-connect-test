@@ -1,10 +1,14 @@
 import bcrypt from "bcryptjs"
 
+import { randomBytes } from "node:crypto"
+
 import { Router } from "express"
 
 import { z } from "zod"
 
 import { authenticate, requireAnyCapability } from "../auth.js"
+
+import { config } from "../config.js"
 
 import { pool } from "../db.js"
 
@@ -13,6 +17,8 @@ import { refreshPlatformRequestLimit } from "../platform-settings.js"
 import { roleAccess } from "../role-access.js"
 
 import { writeAuditLog } from "../audit-log.js"
+
+import { issuePasswordReset } from "../password-reset.js"
 
 import platformUsersRouter from "./platform-users.js"
 
@@ -23,6 +29,99 @@ const router = Router()
 router.use(authenticate, requireAnyCapability("manage_platform"))
 
 router.use("/users", platformUsersRouter)
+
+const platformEditorSchema = z.object({
+  fullName: z.string().trim().min(2).max(120),
+  email: z.email().trim().toLowerCase(),
+})
+
+router.post("/editors", async (request, response) => {
+  const parsed = platformEditorSchema.safeParse(request.body)
+  if (!parsed.success) {
+    response.status(400).json({ error: "Nom ou email de l’éditeur invalide." })
+    return
+  }
+  if (!config.RESEND_API_KEY || !config.EMAIL_FROM || !config.APP_ORIGIN) {
+    response.status(503).json({
+      error: "Configurez l’envoi des emails de sécurité avant d’inviter un éditeur.",
+    })
+    return
+  }
+  const editor = (request as AuthenticatedRequest).authUser
+  const { fullName, email } = parsed.data
+  const initials = initialsFromName(fullName)
+  const access = roleAccess.EDITOR
+  const passwordHash = await bcrypt.hash(randomBytes(48).toString("base64url"), 12)
+  const client = await pool.connect()
+  let created: { id: string; email: string; fullName: string }
+  try {
+    await client.query("BEGIN")
+    const result = await client.query(
+      `INSERT INTO users (
+         email, password_hash, must_change_password, full_name, initials,
+         role, role_label, tenant_name, tenant_plan, sections, capabilities
+       )
+       VALUES ($1, $2, true, $3, $4, 'EDITOR', $5, 'Chantier Connect', '',
+               $6, $7)
+       RETURNING id, email, full_name AS "fullName"`,
+      [
+        email,
+        passwordHash,
+        fullName,
+        initials,
+        access.label,
+        JSON.stringify(access.sections),
+        JSON.stringify(access.capabilities),
+      ],
+    )
+    created = result.rows[0]
+    await writeAuditLog(client, request, {
+      actorId: editor.id,
+      actorRole: editor.role,
+      targetType: "user",
+      targetId: created.id,
+      action: "PLATFORM_EDITOR_CREATED",
+      payloadMasked: { email: email.replace(/^(.).+(@.*)$/, "$1***$2") },
+    })
+    await client.query("COMMIT")
+  } catch (error) {
+    await client.query("ROLLBACK")
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "23505"
+    ) {
+      response.status(409).json({ error: "Un compte utilise déjà cet email." })
+      return
+    }
+    throw error
+  } finally {
+    client.release()
+  }
+
+  const sent = await issuePasswordReset({
+    userId: created.id,
+    email: created.email,
+    fullName: created.fullName,
+    role: "EDITOR",
+    tenantId: null,
+    requestedBy: editor.id,
+    actorRole: editor.role,
+    request,
+  })
+  if (!sent) {
+    response.status(503).json({
+      error: "Le compte éditeur est créé, mais l’invitation n’a pas été envoyée. Relancez l’envoi depuis la liste des utilisateurs.",
+      userId: created.id,
+    })
+    return
+  }
+  response.status(201).json({
+    data: { id: created.id, email: created.email, fullName: created.fullName },
+    message: "Invitation envoyée. L’éditeur devra choisir son mot de passe puis configurer sa MFA.",
+  })
+})
 
 router.get("/audit-logs", async (request, response) => {
   const parsed = z.object({
@@ -296,30 +395,51 @@ router.patch("/registration-requests/:id", async (request, response) => {
   }
 
   const editor = (request as AuthenticatedRequest).authUser
-  const result = await pool.query(
-    `UPDATE registration_requests
-     SET status = $2, reviewed_by = $3, updated_at = now()
-     WHERE id = $1 AND status != 'Entreprise créée'
-     RETURNING id, status, updated_at AS "updatedAt"`,
-    [id.data, parsed.data.status, editor.id],
-  )
-
-  if (!result.rowCount) {
-    const existing = await pool.query(
-      "SELECT status FROM registration_requests WHERE id = $1",
-      [id.data],
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    const result = await client.query(
+      `UPDATE registration_requests
+       SET status = $2, reviewed_by = $3, updated_at = now()
+       WHERE id = $1 AND status != 'Entreprise créée'
+       RETURNING id, tenant_id AS "tenantId", status,
+                 updated_at AS "updatedAt"`,
+      [id.data, parsed.data.status, editor.id],
     )
-    if (!existing.rowCount) {
-      response.status(404).json({ error: "Demande introuvable." })
+
+    if (!result.rowCount) {
+      const existing = await client.query(
+        "SELECT status FROM registration_requests WHERE id = $1",
+        [id.data],
+      )
+      await client.query("ROLLBACK")
+      if (!existing.rowCount) {
+        response.status(404).json({ error: "Demande introuvable." })
+        return
+      }
+      response.status(409).json({
+        error: "Une demande convertie en entreprise ne peut plus être modifiée.",
+      })
       return
     }
-    response.status(409).json({
-      error: "Une demande convertie en entreprise ne peut plus être modifiée.",
-    })
-    return
-  }
 
-  response.json({ data: result.rows[0] })
+    await writeAuditLog(client, request, {
+      actorId: editor.id,
+      actorRole: editor.role,
+      tenantId: result.rows[0].tenantId,
+      targetType: "registration_request",
+      targetId: id.data,
+      action: "REGISTRATION_REQUEST_STATUS_UPDATED",
+      payloadMasked: { status: parsed.data.status },
+    })
+    await client.query("COMMIT")
+    response.json({ data: result.rows[0] })
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
+  }
 })
 
 router.get("/invoices", async (_request, response) => {
@@ -352,13 +472,16 @@ router.post("/invoices", async (request, response) => {
     return
   }
 
-  const invoiceNumber = await pool.query<{ invoiceNumber: string }>(
-    `SELECT 'CC-' || to_char(CURRENT_DATE, 'YYYY') || '-' ||
-            lpad(nextval('platform_invoice_number_seq')::text, 6, '0') AS "invoiceNumber"`,
-  )
   const editor = (request as AuthenticatedRequest).authUser
   const input = parsed.data
-  const result = await pool.query(
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    const invoiceNumber = await client.query<{ invoiceNumber: string }>(
+      `SELECT 'CC-' || to_char(CURRENT_DATE, 'YYYY') || '-' ||
+              lpad(nextval('platform_invoice_number_seq')::text, 6, '0') AS "invoiceNumber"`,
+    )
+    const result = await client.query(
     `WITH created AS (
        INSERT INTO platform_invoices (
          invoice_number, tenant_id, description, amount_fcfa,
@@ -387,14 +510,36 @@ router.post("/invoices", async (request, response) => {
       input.dueAt,
       editor.id,
     ],
-  )
+    )
 
-  if (!result.rowCount) {
-    response.status(404).json({ error: "Entreprise introuvable." })
-    return
+    if (!result.rowCount) {
+      await client.query("ROLLBACK")
+      response.status(404).json({ error: "Entreprise introuvable." })
+      return
+    }
+
+    await writeAuditLog(client, request, {
+      actorId: editor.id,
+      actorRole: editor.role,
+      tenantId: input.tenantId,
+      targetType: "platform_invoice",
+      targetId: result.rows[0].id,
+      action: "PLATFORM_INVOICE_CREATED",
+      payloadMasked: {
+        invoiceNumber: result.rows[0].invoiceNumber,
+        amountFcfa: input.amountFcfa,
+        issuedAt: input.issuedAt,
+        dueAt: input.dueAt,
+      },
+    })
+    await client.query("COMMIT")
+    response.status(201).json({ data: result.rows[0] })
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
   }
-
-  response.status(201).json({ data: result.rows[0] })
 })
 
 router.patch("/invoices/:id/status", async (request, response) => {
@@ -408,8 +553,8 @@ router.patch("/invoices/:id/status", async (request, response) => {
   const client = await pool.connect()
   try {
     await client.query("BEGIN")
-    const current = await client.query<{ status: string }>(
-      "SELECT status FROM platform_invoices WHERE id = $1 FOR UPDATE",
+    const current = await client.query<{ status: string; tenant_id: string }>(
+      "SELECT status, tenant_id FROM platform_invoices WHERE id = $1 FOR UPDATE",
       [id.data],
     )
     if (!current.rowCount) {
@@ -441,6 +586,21 @@ router.patch("/invoices/:id/status", async (request, response) => {
         editor.id,
       ],
     )
+    await writeAuditLog(client, request, {
+      actorId: editor.id,
+      actorRole: editor.role,
+      tenantId: current.rows[0]!.tenant_id,
+      targetType: "platform_invoice",
+      targetId: id.data,
+      action: parsed.data.status === "Payée"
+        ? "PLATFORM_INVOICE_MARKED_PAID"
+        : "PLATFORM_INVOICE_CANCELLED",
+      payloadMasked: {
+        paymentMethod: parsed.data.status === "Payée" ? parsed.data.paymentMethod : null,
+        paymentReferenceProvided:
+          parsed.data.status === "Payée" && Boolean(parsed.data.paymentReference),
+      },
+    })
     await client.query("COMMIT")
     response.json({ data: result.rows[0] })
   } catch (error) {
@@ -745,7 +905,12 @@ router.post("/plans", async (request, response) => {
   try {
     const plan = parsed.data
 
-    const result = await pool.query(
+    const editor = (request as AuthenticatedRequest).authUser
+    const client = await pool.connect()
+    let result
+    try {
+      await client.query("BEGIN")
+      result = await client.query(
       `INSERT INTO subscription_plans (name, monthly_price_fcfa, max_users, max_sites, max_storage_mb, active)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, name, monthly_price_fcfa AS "monthlyPriceFcfa",
@@ -760,7 +925,22 @@ router.post("/plans", async (request, response) => {
         plan.maxStorageMb,
         plan.active ?? true,
       ],
-    )
+      )
+      await writeAuditLog(client, request, {
+        actorId: editor.id,
+        actorRole: editor.role,
+        targetType: "subscription_plan",
+        targetId: result.rows[0].id,
+        action: "SUBSCRIPTION_PLAN_CREATED",
+        payloadMasked: plan,
+      })
+      await client.query("COMMIT")
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
 
     response.status(201).json({ data: result.rows[0] })
   } catch (error) {
@@ -899,7 +1079,10 @@ router.post("/tickets", async (request, response) => {
 
   const editor = (request as AuthenticatedRequest).authUser
 
-  const result = await pool.query(
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    const result = await client.query(
     `INSERT INTO support_tickets (tenant_id, created_by, subject, description, priority)
      SELECT id, $2, $3, $4, $5 FROM tenants WHERE id = $1
      RETURNING id, tenant_id AS "tenantId", subject, description, priority, status,
@@ -912,15 +1095,31 @@ router.post("/tickets", async (request, response) => {
       ticket.description,
       ticket.priority,
     ],
-  )
+    )
 
-  if (!result.rowCount) {
-    response.status(404).json({ error: "Entreprise introuvable." })
+    if (!result.rowCount) {
+      await client.query("ROLLBACK")
+      response.status(404).json({ error: "Entreprise introuvable." })
+      return
+    }
 
-    return
+    await writeAuditLog(client, request, {
+      actorId: editor.id,
+      actorRole: editor.role,
+      tenantId: ticket.tenantId,
+      targetType: "support_ticket",
+      targetId: result.rows[0].id,
+      action: "SUPPORT_TICKET_CREATED",
+      payloadMasked: { priority: ticket.priority },
+    })
+    await client.query("COMMIT")
+    response.status(201).json({ data: result.rows[0] })
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
   }
-
-  response.status(201).json({ data: result.rows[0] })
 })
 
 router.patch("/tickets/:id/status", async (request, response) => {
@@ -936,23 +1135,44 @@ router.patch("/tickets/:id/status", async (request, response) => {
     return
   }
 
-  const result = await pool.query(
+  const editor = (request as AuthenticatedRequest).authUser
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    const result = await client.query(
     `UPDATE support_tickets
      SET status = $2, updated_at = now(),
          resolved_at = CASE WHEN $2 = 'Résolu' THEN now() ELSE NULL END
      WHERE id = $1
-     RETURNING id, status, updated_at AS "updatedAt", resolved_at AS "resolvedAt"`,
+     RETURNING id, tenant_id AS "tenantId", status,
+               updated_at AS "updatedAt", resolved_at AS "resolvedAt"`,
 
     [id.data, parsed.data.status],
-  )
+    )
 
-  if (!result.rowCount) {
-    response.status(404).json({ error: "Ticket introuvable." })
+    if (!result.rowCount) {
+      await client.query("ROLLBACK")
+      response.status(404).json({ error: "Ticket introuvable." })
+      return
+    }
 
-    return
+    await writeAuditLog(client, request, {
+      actorId: editor.id,
+      actorRole: editor.role,
+      tenantId: result.rows[0].tenantId,
+      targetType: "support_ticket",
+      targetId: id.data,
+      action: "SUPPORT_TICKET_STATUS_UPDATED",
+      payloadMasked: { status: parsed.data.status },
+    })
+    await client.query("COMMIT")
+    response.json({ data: result.rows[0] })
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
   }
-
-  response.json({ data: result.rows[0] })
 })
 
 router.get("/settings", async (_request, response) => {
@@ -989,27 +1209,46 @@ router.put("/settings", async (request, response) => {
 
   const settings = parsed.data
 
-  const result = await pool.query(
-    `UPDATE platform_settings
-     SET name = $1, support_email = $2, request_limit = $3, updated_at = now()
-     WHERE singleton = true
-     RETURNING name, support_email AS "supportEmail",
-               request_limit AS "requestLimit", updated_at AS "updatedAt"`,
+  const editor = (request as AuthenticatedRequest).authUser
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    const result = await client.query(
+      `UPDATE platform_settings
+       SET name = $1, support_email = $2, request_limit = $3, updated_at = now()
+       WHERE singleton = true
+       RETURNING name, support_email AS "supportEmail",
+                 request_limit AS "requestLimit", updated_at AS "updatedAt"`,
+      [settings.name, settings.supportEmail, settings.requestLimit],
+    )
 
-    [settings.name, settings.supportEmail, settings.requestLimit],
-  )
+    if (!result.rowCount) {
+      await client.query("ROLLBACK")
+      response
+        .status(404)
+        .json({ error: "Paramètres de la plateforme introuvables." })
 
-  if (!result.rowCount) {
-    response
-      .status(404)
-      .json({ error: "Paramètres de la plateforme introuvables." })
+      return
+    }
 
-    return
+    await writeAuditLog(client, request, {
+      actorId: editor.id,
+      actorRole: editor.role,
+      targetType: "platform_settings",
+      targetId: "singleton",
+      action: "PLATFORM_SETTINGS_UPDATED",
+      payloadMasked: settings,
+    })
+    await client.query("COMMIT")
+    refreshPlatformRequestLimit(settings.requestLimit)
+
+    response.json({ data: result.rows[0] })
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
   }
-
-  refreshPlatformRequestLimit(settings.requestLimit)
-
-  response.json({ data: result.rows[0] })
 })
 
 export default router

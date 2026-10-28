@@ -12,6 +12,16 @@ Application React/Vite et Cloudflare Worker. Le Worker sert les fichiers statiqu
 
 Ne définissez pas `DATABASE_URL` ou `JWT_SECRET` dans Cloudflare : ces secrets appartiennent uniquement au service backend. Supprimez aussi de Cloudflare les anciens secrets backend inutilisés. `API_ORIGIN` n’est pas un secret.
 
+## Application installable (PWA)
+
+L’application fournit un manifeste Web, les icônes Android/iOS et un service
+worker qui met en cache la coque de l’application pour son ouverture hors
+connexion. Les requêtes `/api/*` ne sont jamais mises en cache : connexion,
+données et actions métier nécessitent toujours le backend et une connexion
+réseau. Sur les navigateurs compatibles, le bouton **Installer l’application**
+apparaît dans l’espace connecté; sur iOS, utiliser **Partager > Sur l’écran
+d’accueil**.
+
 ## Développement
 
 ```powershell

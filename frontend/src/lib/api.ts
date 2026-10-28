@@ -85,6 +85,8 @@ export interface Site {
 
   plannedDurationDays: number | null
 
+  hasImage: boolean
+
   teamCount: number | null
 
   createdAt: string
@@ -663,13 +665,42 @@ export const api = {
   },
 
   async login(identifier: string, password: string, rememberMe: boolean) {
-    const result = await request<{ user: AuthUser }>("/api/auth/login", {
+    return request<
+      | { user: AuthUser }
+      | { mfaRequired: true; challengeToken: string }
+      | { mfaSetupRequired: true; setupToken: string }
+    >("/api/auth/login", {
       method: "POST",
 
       body: JSON.stringify({ identifier, password, rememberMe }),
     })
+  },
 
-    return result.user
+  async startEditorMfaSetup(setupToken: string) {
+    const result = await request<{
+      data: { secret: string; provisioningUri: string }
+    }>("/api/auth/mfa/setup", {
+      method: "POST",
+      body: JSON.stringify({ setupToken }),
+    })
+    return result.data
+  },
+
+  async enableEditorMfa(setupToken: string, code: string) {
+    return request<{ user: AuthUser; recoveryCodes: string[] }>(
+      "/api/auth/mfa/enable",
+      { method: "POST", body: JSON.stringify({ setupToken, code }) },
+    )
+  },
+
+  async verifyEditorMfa(
+    challengeToken: string,
+    input: { code: string } | { recoveryCode: string },
+  ) {
+    return request<{ user: AuthUser }>("/api/auth/mfa/verify", {
+      method: "POST",
+      body: JSON.stringify({ challengeToken, ...input }),
+    })
   },
 
   async requestPasswordReset(email: string) {
@@ -783,6 +814,10 @@ export const api = {
     startDate?: string | null
     endDate?: string | null
     plannedDurationDays?: number | null
+    coverImage?: {
+      contentType: "image/jpeg" | "image/png" | "image/webp"
+      imageBase64: string
+    }
   }) {
     const result = await request<{ data: Site }>("/api/sites", {
       method: "POST",
@@ -813,6 +848,29 @@ export const api = {
       body: JSON.stringify(input),
     })
     return result.data
+  },
+
+  async uploadSiteImage(
+    id: string,
+    input: {
+      contentType: "image/jpeg" | "image/png" | "image/webp"
+      imageBase64: string
+    },
+  ) {
+    await request<void>(`/api/sites/${encodeURIComponent(id)}/image`, {
+      method: "PUT",
+      body: JSON.stringify(input),
+    })
+  },
+
+  async deleteSiteImage(id: string) {
+    await request<void>(`/api/sites/${encodeURIComponent(id)}/image`, {
+      method: "DELETE",
+    })
+  },
+
+  siteImageUrl(id: string) {
+    return `/api/sites/${encodeURIComponent(id)}/image`
   },
 
   async tasks() {
@@ -1275,6 +1333,16 @@ export const api = {
       `/api/platform/users?${search.toString()}`,
     )
     return result
+  },
+
+  async createPlatformEditor(input: { fullName: string; email: string }) {
+    return request<{
+      data: { id: string; email: string; fullName: string }
+      message: string
+    }>("/api/platform/editors", {
+      method: "POST",
+      body: JSON.stringify(input),
+    })
   },
 
   async updatePlatformUser(id: string, input: { fullName?: string; email?: string; phone?: string | null }) {

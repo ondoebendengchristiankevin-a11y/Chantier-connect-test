@@ -21,6 +21,14 @@ const environmentSchema = z.object({
     .string()
     .min(32, "JWT_SECRET doit contenir au moins 32 caractères."),
 
+  MFA_ENCRYPTION_KEY: z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z.string().refine((value) => {
+      const decoded = Buffer.from(value, "base64")
+      return decoded.length === 32 && decoded.toString("base64") === value
+    }, "MFA_ENCRYPTION_KEY doit être une clé Base64 aléatoire de 32 octets.").optional(),
+  ),
+
   RESEND_API_KEY: z.preprocess(
     (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
     z.string().trim().min(1).optional(),
@@ -64,6 +72,31 @@ const productionConfigurationErrors: string[] = []
 if (result.data.NODE_ENV === "production") {
   if (!result.data.DATABASE_SSL) {
     productionConfigurationErrors.push("DATABASE_SSL doit être activé.")
+  }
+
+  if (!result.data.MFA_ENCRYPTION_KEY) {
+    productionConfigurationErrors.push(
+      "MFA_ENCRYPTION_KEY doit être configurée pour chiffrer les secrets TOTP.",
+    )
+  }
+
+  if (
+    !result.data.RESEND_API_KEY ||
+    !result.data.EMAIL_FROM ||
+    !result.data.APP_ORIGIN
+  ) {
+    productionConfigurationErrors.push(
+      "RESEND_API_KEY, EMAIL_FROM et APP_ORIGIN sont requis pour les emails de sécurité.",
+    )
+  }
+
+  if (
+    result.data.APP_ORIGIN &&
+    new URL(result.data.APP_ORIGIN).protocol !== "https:"
+  ) {
+    productionConfigurationErrors.push(
+      "APP_ORIGIN doit utiliser HTTPS en production.",
+    )
   }
 
   const isPlaceholderSecret =

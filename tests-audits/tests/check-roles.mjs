@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { createHmac } from "node:crypto"
 
 import "dotenv/config"
 
@@ -272,8 +273,35 @@ async function request(path, options = {}, cookie) {
   return { response, body }
 }
 
-async function login(email, password) {
-  const { response, body } = await request("/api/auth/login", {
+function currentTotpCode(secret) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+  let bits = 0
+  let value = 0
+  const bytes = []
+  for (const character of secret.toUpperCase().replace(/=+$/, "")) {
+    const digit = alphabet.indexOf(character)
+    assert.ok(digit >= 0, "CHECK_ROLES_EDITOR_TOTP_SECRET doit être une clé Base32.")
+    value = (value << 5) | digit
+    bits += 5
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 255)
+      bits -= 8
+    }
+  }
+  const counter = Buffer.alloc(8)
+  counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 1000 / 30)))
+  const digest = createHmac("sha1", Buffer.from(bytes)).update(counter).digest()
+  const offset = digest[digest.length - 1] & 15
+  const binary =
+    ((digest[offset] & 127) << 24) |
+    ((digest[offset + 1] & 255) << 16) |
+    ((digest[offset + 2] & 255) << 8) |
+    (digest[offset + 3] & 255)
+  return String(binary % 1_000_000).padStart(6, "0")
+}
+
+async function login(email, password, expectedRole) {
+  let { response, body } = await request("/api/auth/login", {
     method: "POST",
 
     headers: { "Content-Type": "application/json" },
@@ -286,6 +314,31 @@ async function login(email, password) {
     200,
     `Connexion de recette refusée pour ${email}.`,
   )
+
+  if (body.mfaSetupRequired) {
+    throw new Error(
+      "Le compte Éditeur doit terminer son enrôlement MFA sur /connexion avant la recette; ne configurez pas automatiquement une MFA à distance.",
+    )
+  }
+  if (body.mfaRequired) {
+    assert.equal(expectedRole, "EDITOR")
+    const secret = process.env.CHECK_ROLES_EDITOR_TOTP_SECRET
+    assert.ok(
+      secret,
+      "Définissez CHECK_ROLES_EDITOR_TOTP_SECRET localement pour tester l’accès Éditeur MFA.",
+    )
+    const verified = await request("/api/auth/mfa/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        challengeToken: body.challengeToken,
+        code: currentTotpCode(secret),
+      }),
+    })
+    assert.equal(verified.response.status, 200, "Code TOTP Éditeur invalide.")
+    body = verified.body
+    response = verified.response
+  }
 
   const cookieHeader = response.headers.get("set-cookie")
 
@@ -311,7 +364,7 @@ async function checkStatus(session, path, expectedStatus, label) {
 const sessions = new Map()
 
 for (const expected of users) {
-  const session = await login(expected.email, expected.password)
+  const session = await login(expected.email, expected.password, expected.role)
 
   assert.equal(
     session.user.role,

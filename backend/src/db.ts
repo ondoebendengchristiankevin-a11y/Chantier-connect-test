@@ -1,18 +1,29 @@
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 
 import pg from "pg"
+import { resolve } from "node:path"
 import { config } from "./config.js"
+import { fileURLToPath } from "node:url"
 
-const ssl = config.DATABASE_SSL
-  ? {
-      ca: readFileSync(new URL("../prod-ca-2021.crt", import.meta.url), "utf8"),
-      rejectUnauthorized: true,
-    }
-  : false
+function postgresTlsConfig() {
+  if (!config.DATABASE_SSL) return false
+  const caPath = [
+    resolve(process.cwd(), "prod-ca-2021.crt"),
+    resolve(process.cwd(), "backend", "prod-ca-2021.crt"),
+    fileURLToPath(new URL("../prod-ca-2021.crt", import.meta.url)),
+  ].find(existsSync)
+  if (!caPath) {
+    throw new Error("Le certificat PostgreSQL prod-ca-2021.crt est introuvable.")
+  }
+  return {
+    ca: readFileSync(caPath, "utf8"),
+    rejectUnauthorized: true,
+  }
+}
 
 export const pool = new pg.Pool({
   connectionString: config.DATABASE_URL,
-  ssl,
+  ssl: postgresTlsConfig(),
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,

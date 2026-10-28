@@ -4,9 +4,9 @@ Ce dossier regroupe les contrôles automatisés du projet et les comptes rendus 
 
 ## Contenu
 
-- [`tests/check-roles.mjs`](./tests/check-roles.mjs) : smoke test des autorisations, des chantiers visibles et, avec un second compte, du cloisonnement entre deux entreprises.
-- [`tests/check-tenant-isolation.mjs`](./tests/check-tenant-isolation.mjs) : crée une base PostgreSQL locale temporaire, exécute toutes les migrations et vérifie les lectures et écritures entre deux tenants isolés; la base temporaire est supprimée à la fin.
-- [`tests/check-production-config.mjs`](./tests/check-production-config.mjs) : vérifie que la configuration backend refuse une production sans TLS PostgreSQL et sans clé JWT suffisamment robuste.
+- [`tests/check-roles.mjs`](./tests/check-roles.mjs) : smoke test des autorisations, des chantiers visibles et, avec un second compte, du cloisonnement entre deux entreprises. La recette Éditeur exige une clé TOTP dédiée dans `CHECK_ROLES_EDITOR_TOTP_SECRET`; elle ne configure jamais la MFA à votre place.
+- [`tests/check-tenant-isolation.mjs`](./tests/check-tenant-isolation.mjs) : crée une base PostgreSQL locale temporaire, exécute toutes les migrations et vérifie les lectures et écritures entre deux tenants isolés, l’enrôlement MFA Éditeur, les codes de secours, les audits et les seuils de licences; la base temporaire est supprimée à la fin.
+- [`tests/check-production-config.mjs`](./tests/check-production-config.mjs) : vérifie que la configuration backend refuse une production sans TLS PostgreSQL, sans clé JWT suffisamment robuste ou sans clé de chiffrement MFA.
 - [`audits/etat-pilote-2026-10-18.md`](./audits/etat-pilote-2026-10-18.md) : résultats vérifiés et points restant à valider avant la production.
 
 ## Lancer le contrôle des rôles
@@ -22,6 +22,8 @@ Pour exercer également le contrôle entre deux entreprises, fournir localement 
 Le script limite ses requêtes à une API HTTP sur la machine locale. Il ne migre, ne réinitialise et ne peuple aucune base de données.
 
 Pour une vraie préproduction, définir `CHECK_ROLES_BASE_URL` avec l’origine HTTPS de l’API, `CHECK_ROLES_ALLOW_REMOTE=true`, `CHECK_ROLES_USERS_JSON` avec les huit comptes de recette dédiés (leurs rôles et sites attendus) ainsi que les variables du compte administrateur du second tenant. Utiliser des mots de passe de recette temporaires, réservés à l’environnement et ne pas partager leurs valeurs. La cible distante est bloquée sans HTTPS, opt-in explicite et second tenant.
+
+Le compte Éditeur doit déjà avoir terminé son enrôlement MFA à `/connexion`. Fournir sa clé TOTP de recette via `CHECK_ROLES_EDITOR_TOTP_SECRET` dans l’environnement local de recette seulement; ne pas la stocker dans un fichier versionné ni la réutiliser sur un compte de production.
 
 Pour simuler l’isolation sans toucher à la base actuellement configurée dans `.env`, après le build et avec un PostgreSQL local autorisant `CREATE DATABASE` et `DROP DATABASE` :
 

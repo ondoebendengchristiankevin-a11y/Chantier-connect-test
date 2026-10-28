@@ -185,6 +185,11 @@ router.put(
   },
 )
 
+const siteImageSchema = z.object({
+  contentType: z.enum(["image/jpeg", "image/png", "image/webp"]),
+  imageBase64: z.string().min(1).max(2_800_000),
+})
+
 const siteSchema = z.object({
   name: z.string().trim().min(2).max(120),
 
@@ -214,6 +219,7 @@ const siteSchema = z.object({
 
   endDate: z.iso.date().nullable().optional(),
   plannedDurationDays: z.number().int().min(1).max(3650).nullable().optional(),
+  coverImage: siteImageSchema.optional(),
 }).refine(
   (site) => !site.startDate || !site.endDate || site.endDate >= site.startDate,
   { path: ["endDate"], message: "L’échéance ne peut pas précéder la date de début." },
@@ -268,6 +274,36 @@ const photoSchema = z.object({
 
   capturedAt: z.iso.datetime().optional(),
 })
+
+function decodeSiteCoverImage(
+  coverImage: z.infer<typeof siteImageSchema> | undefined,
+): { imageData: Buffer | null; contentType: string | null; error: string | null } {
+  if (!coverImage) return { imageData: null, contentType: null, error: null }
+  const imageData = Buffer.from(coverImage.imageBase64, "base64")
+  if (
+    imageData.length === 0 ||
+    imageData.length > 2 * 1024 * 1024 ||
+    imageData.toString("base64") !== coverImage.imageBase64
+  ) {
+    return { imageData: null, contentType: null, error: "L’image doit peser au maximum 2 Mo." }
+  }
+  const validSignature =
+    (coverImage.contentType === "image/jpeg" &&
+      imageData.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) ||
+    (coverImage.contentType === "image/png" &&
+      imageData.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) ||
+    (coverImage.contentType === "image/webp" &&
+      imageData.toString("ascii", 0, 4) === "RIFF" &&
+      imageData.toString("ascii", 8, 12) === "WEBP")
+  if (!validSignature) {
+    return {
+      imageData: null,
+      contentType: null,
+      error: "Le contenu ne correspond pas au format image choisi.",
+    }
+  }
+  return { imageData, contentType: coverImage.contentType, error: null }
+}
 
 const attendanceSchema = z.object({
   latitude: z.number().min(-90).max(90).nullable().optional(),
@@ -892,6 +928,7 @@ router.get(
                CASE WHEN $5::boolean THEN s.end_date ELSE NULL END AS "endDate",
                CASE WHEN $5::boolean THEN s.planned_duration_days ELSE NULL END AS "plannedDurationDays",
                s.created_at AS "createdAt",
+               CASE WHEN $5::boolean THEN s.cover_image_data IS NOT NULL ELSE false END AS "hasImage",
                CASE WHEN $5::boolean THEN (
                  SELECT count(*)::integer FROM users assigned_user
                  WHERE assigned_user.assigned_site_id = s.id
@@ -913,6 +950,161 @@ router.get(
     )
 
     response.json({ data: result.rows })
+  },
+)
+
+router.get(
+  "/sites/:id/image",
+  requireAnyCapability("manage_sites", "read_assigned", "manage_finance", "read_finance"),
+  async (request, response) => {
+    const userRequest = request as AuthenticatedRequest
+    const tenantId = requireTenant(userRequest, response)
+    if (!tenantId) return
+    const id = z.uuid().safeParse(request.params.id)
+    if (!id.success) {
+      response.status(400).json({ error: "Identifiant de chantier invalide." })
+      return
+    }
+    const canReadAll =
+      userRequest.authUser.capabilities.includes("manage_sites") ||
+      userRequest.authUser.capabilities.includes("manage_finance") ||
+      userRequest.authUser.capabilities.includes("read_finance")
+    const result = await pool.query<{
+      imageData: Buffer | null
+      contentType: string | null
+    }>(
+      `SELECT cover_image_data AS "imageData",
+              cover_image_content_type AS "contentType"
+       FROM sites
+       WHERE id = $1 AND tenant_id = $2
+         AND ($3::boolean OR id = $4::uuid)`,
+      [id.data, tenantId, canReadAll, userRequest.authUser.assignedSiteId],
+    )
+    const image = result.rows[0]
+    if (!image?.imageData || !image.contentType) {
+      response.status(404).json({ error: "Image de chantier introuvable." })
+      return
+    }
+    response.setHeader("Cache-Control", "private, no-store")
+    response.setHeader("X-Content-Type-Options", "nosniff")
+    response.type(image.contentType).send(image.imageData)
+  },
+)
+
+router.put(
+  "/sites/:id/image",
+  requireAnyCapability("manage_sites"),
+  async (request, response) => {
+    const userRequest = request as AuthenticatedRequest
+    const tenantId = requireTenant(userRequest, response)
+    if (!tenantId) return
+    const id = z.uuid().safeParse(request.params.id)
+    const parsed = siteImageSchema.safeParse(request.body)
+    if (!id.success || !parsed.success) {
+      response.status(400).json({ error: "Image ou identifiant de chantier invalide." })
+      return
+    }
+    const decodedImage = decodeSiteCoverImage(parsed.data)
+    if (decodedImage.error || !decodedImage.imageData || !decodedImage.contentType) {
+      response.status(400).json({
+        error: decodedImage.error ?? "Image de chantier invalide.",
+      })
+      return
+    }
+    const { imageData: image, contentType } = decodedImage
+
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const capacity = await tenantStorageCapacity(
+        client,
+        tenantId,
+        image.length,
+        undefined,
+        id.data,
+      )
+      if (!capacity.allowed) {
+        await client.query("ROLLBACK")
+        response.status(409).json({
+          error: `La limite de stockage du plan (${capacity.maxStorageMb} Mo) est atteinte.`,
+        })
+        return
+      }
+      const updated = await client.query(
+        `UPDATE sites
+         SET cover_image_data = $1, cover_image_content_type = $2
+         WHERE id = $3 AND tenant_id = $4
+         RETURNING id`,
+        [image, contentType, id.data, tenantId],
+      )
+      if (!updated.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(404).json({ error: "Chantier introuvable." })
+        return
+      }
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "site",
+        targetId: id.data,
+        action: "SITE_COVER_IMAGE_UPDATED",
+        payloadMasked: { contentType, bytes: image.length },
+      })
+      await client.query("COMMIT")
+      response.status(204).end()
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  },
+)
+
+router.delete(
+  "/sites/:id/image",
+  requireAnyCapability("manage_sites"),
+  async (request, response) => {
+    const userRequest = request as AuthenticatedRequest
+    const tenantId = requireTenant(userRequest, response)
+    if (!tenantId) return
+    const id = z.uuid().safeParse(request.params.id)
+    if (!id.success) {
+      response.status(400).json({ error: "Identifiant de chantier invalide." })
+      return
+    }
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const removed = await client.query(
+        `UPDATE sites
+         SET cover_image_data = NULL, cover_image_content_type = NULL
+         WHERE id = $1 AND tenant_id = $2
+         RETURNING id`,
+        [id.data, tenantId],
+      )
+      if (!removed.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(404).json({ error: "Chantier introuvable." })
+        return
+      }
+      await writeAuditLog(client, request, {
+        actorId: userRequest.authUser.id,
+        actorRole: userRequest.authUser.role,
+        tenantId,
+        targetType: "site",
+        targetId: id.data,
+        action: "SITE_COVER_IMAGE_REMOVED",
+      })
+      await client.query("COMMIT")
+      response.status(204).end()
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
   },
 )
 
@@ -948,6 +1140,7 @@ router.get(
               s.end_date AS "endDate",
               s.planned_duration_days AS "plannedDurationDays",
               s.created_at AS "createdAt",
+              (s.cover_image_data IS NOT NULL) AS "hasImage",
               COALESCE(jsonb_agg(jsonb_build_object(
                 'id', u.id, 'fullName', u.full_name, 'role', u.role, 'active', u.active
               )) FILTER (WHERE u.id IS NOT NULL), '[]'::jsonb) AS "assignedTeam",
@@ -990,12 +1183,31 @@ router.post(
     }
 
     const site = parsed.data
+    const coverImage = decodeSiteCoverImage(site.coverImage)
+    if (coverImage.error) {
+      response.status(400).json({ error: coverImage.error })
+      return
+    }
 
     const client = await pool.connect()
     let result
     try {
       await client.query("BEGIN")
       await client.query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE", [tenantId])
+      if (coverImage.imageData) {
+        const capacity = await tenantStorageCapacity(
+          client,
+          tenantId,
+          coverImage.imageData.length,
+        )
+        if (!capacity.allowed) {
+          await client.query("ROLLBACK")
+          response.status(409).json({
+            error: `La limite de stockage du plan (${capacity.maxStorageMb} Mo) est atteinte.`,
+          })
+          return
+        }
+      }
       const plan = await client.query<{ max_sites: number | null }>(
         `SELECT p.max_sites FROM tenant_subscriptions ts
          JOIN subscription_plans p ON p.id = ts.plan_id WHERE ts.tenant_id = $1`,
@@ -1015,9 +1227,10 @@ router.post(
          tenant_id, name, description, location, city, province, client_name,
          work_type, contract_reference, status, cost_budget_fcfa,
          contract_amount_fcfa,
-         start_date, end_date, planned_duration_days
+         start_date, end_date, planned_duration_days,
+         cover_image_data, cover_image_content_type
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        RETURNING id, name, description, location, city, province,
                  client_name AS "clientName", work_type AS "workType",
                  contract_reference AS "contractReference",
@@ -1028,6 +1241,7 @@ router.post(
                  start_date AS "startDate", end_date AS "endDate",
                  planned_duration_days AS "plannedDurationDays",
                  created_at AS "createdAt",
+                 (cover_image_data IS NOT NULL) AS "hasImage",
                  0::integer AS "teamCount"`,
 
       [
@@ -1046,6 +1260,8 @@ router.post(
         site.startDate ?? null,
         site.endDate ?? null,
         site.plannedDurationDays ?? null,
+        coverImage.imageData,
+        coverImage.contentType,
       ],
       )
 
@@ -1056,7 +1272,11 @@ router.post(
         targetType: "site",
         targetId: result.rows[0].id,
         action: "SITE_CREATED",
-        payloadMasked: { name: site.name, status: site.status },
+        payloadMasked: {
+          name: site.name,
+          status: site.status,
+          hasImage: Boolean(coverImage.imageData),
+        },
       })
       await client.query("COMMIT")
     } catch (error) {
@@ -1103,7 +1323,8 @@ router.patch(
                    contract_amount_fcfa AS "contractAmountFcfa",
                    start_date AS "startDate", end_date AS "endDate",
                    planned_duration_days AS "plannedDurationDays",
-                   created_at AS "createdAt"`,
+                   created_at AS "createdAt",
+                   (cover_image_data IS NOT NULL) AS "hasImage"`,
         [
           site.name,
           site.description ?? null,

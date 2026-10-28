@@ -11,7 +11,13 @@ Copiez `.env.example` vers `.env` en développement et renseignez :
   certificat TLS PostgreSQL avec le CA versionné `prod-ca-2021.crt`; gardez ce
   fichier présent à la racine du projet déployé.
 - `JWT_SECRET` : clé aléatoire d’au moins 64 caractères en production.
-- `RESEND_API_KEY`, `EMAIL_FROM` et `APP_ORIGIN` : configuration facultative de l’envoi des liens de réinitialisation. `EMAIL_FROM` doit être une adresse/domaine validé par Resend et `APP_ORIGIN` l’origine HTTPS publique du frontend en production.
+- `MFA_ENCRYPTION_KEY` : clé Base64 aléatoire de 32 octets, obligatoire en
+  production; elle chiffre les secrets TOTP des comptes Éditeur. Générez-la
+  avec `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`
+  et conservez-la dans le gestionnaire de secrets de l’hébergeur. Sa perte rend
+  les secrets TOTP stockés irrécupérables; sa rotation nécessite une procédure
+  dédiée avant de remplacer la clé.
+- `RESEND_API_KEY`, `EMAIL_FROM` et `APP_ORIGIN` : configuration facultative en développement, mais obligatoire en production pour les emails de récupération et d’invitation Éditeur. `EMAIL_FROM` doit être une adresse/domaine validé par Resend et `APP_ORIGIN` l’origine HTTPS publique du frontend.
 - `NODE_ENV=production` et `PORT` (le port fourni par l’hébergeur).
 
 Ne commitez jamais `.env`, et ne lancez pas les données de démonstration en production.
@@ -33,6 +39,10 @@ La migration `012_site_project_details.sql` enrichit les chantiers avec leur des
 La migration `013_company_budget_and_supplier_invoices.sql` ajoute les budgets annuels de fonctionnement, le circuit des factures fournisseurs et la référence d’encaissement des situations clients. Appliquez les migrations `012` et `013` avant le déploiement de l’API correspondante.
 
 La migration `014_site_contract_and_cost_budgets.sql` sépare l’enveloppe de coûts prévue du montant contractuel facturé au client. Les anciennes valeurs sont reprises comme enveloppes de coûts, puisqu’elles étaient comparées aux engagements; la colonne historique reste synchronisée pour permettre une transition sans interruption. Appliquez-la avant de déployer la nouvelle version API.
+
+La migration `015_site_cover_images.sql` ajoute les images de couverture des chantiers. Appliquez-la avant de déployer cette version de l’API; les images sont limitées à 2 Mo et comptabilisées dans le quota de stockage du tenant.
+
+La migration `016_editor_mfa.sql` impose une nouvelle connexion aux comptes Éditeur, puis exige une authentification TOTP avec codes de secours à usage unique. Appliquez-la avant d’exposer l’API mise à jour. Après la migration, connectez-vous à chaque compte Éditeur existant pour l’enrôler. Configurez et sauvegardez `MFA_ENCRYPTION_KEY` avant l’enrôlement. Un lien de réinitialisation de mot de passe Éditeur révoque ses sessions et réinitialise son MFA; le compte doit ensuite choisir un nouveau mot de passe et réenrôler son authentificateur. Le second Éditeur se crée depuis l’espace **Utilisateurs**; l’envoi des invitations dépend du service email configuré.
 
 La progression d’un chantier est calculée par l’API à partir du ratio de tâches « Terminée » sur les tâches définies (0 % sans tâche); elle ne peut plus être saisie directement. Le budget annuel de fonctionnement est distinct des coûts prévus et des montants contractuels des chantiers. L’espace Budget compare les enveloppes de coûts aux engagements/prévisions de dépenses; le montant contractuel correspond à la recette facturable au client et n’est pas utilisé pour mesurer les dépassements de coûts. L’Admin entreprise peut créer et corriger les engagements/prévisions tant qu’ils restent prévus, et les dossiers clients tant qu’ils sont en préparation. Seul le rôle Comptable peut marquer une écriture comme réalisée ou faire évoluer le statut d’un dossier transmis. La confirmation d’une situation encaissée exige une référence et crée, dans la même transaction, une entrée de trésorerie réalisée; le paiement d’une facture fournisseur suit le même principe côté dépenses.
 

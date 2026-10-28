@@ -1,0 +1,26 @@
+{
+  "id": "/",
+  "name": "Chantier Connect",
+  "short_name": "Chantier Connect",
+  "description": "Suivi des chantiers, équipes, rapports et finances BTP.",
+  "lang": "fr",
+  "start_url": "/connexion",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f5f7f4",
+  "theme_color": "#173c2a",
+  "icons": [
+    {
+      "src": "/android-chrome-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/android-chrome-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

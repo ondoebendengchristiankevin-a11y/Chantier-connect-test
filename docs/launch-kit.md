@@ -17,13 +17,19 @@ Pour cette version, factures et règlements sont gérés manuellement. Le paieme
 - Déployer sur un domaine contrôlé avec HTTPS et une configuration `production` dédiée.
 - Utiliser une base PostgreSQL de production distincte; appliquer les migrations, sans exécuter le seed de démonstration.
 - Vérifier les secrets de production, la politique de cookies sécurisés, le proxy de confiance et les règles réseau PostgreSQL.
+- Configurer `MFA_ENCRYPTION_KEY` comme secret Base64 de 32 octets avant la migration 016; la sauvegarder avec les autres secrets, et enrôler tous les comptes Éditeur avec une application TOTP.
+- Créer et tester un second compte Éditeur, conserver ses codes de secours dans un emplacement séparé et vérifier la procédure de récupération via email avant le lancement.
+- Appliquer toutes les migrations, y compris `016_editor_mfa.sql`, dans la base de préproduction avant de déployer la version API correspondante.
 - Mettre en place des sauvegardes chiffrées et réaliser un exercice documenté de restauration.
 - Surveiller le health check, les erreurs API, l’espace disque et les connexions PostgreSQL; définir un responsable d’astreinte.
 - Tester les parcours d’accès et l’isolation des tenants avec au moins deux entreprises et chaque rôle.
 - Tester la récupération de compte, la désactivation d’un utilisateur, l’expiration d’un abonnement et la restauration de session.
+- Tester la connexion Éditeur avec TOTP, l’usage unique d’un code de secours, son rejet après usage, et la récupération MFA par réinitialisation email.
 - Vérifier les mentions légales et fiscales des factures avec un conseil local; la sortie imprimée de l’application ne remplace pas cette validation.
 - Formaliser le contrat, les conditions de service, la politique de confidentialité, la conservation des données et la procédure de support.
 - Effectuer un pilote limité avec des données non critiques avant l’ouverture commerciale générale.
+
+Le mode de commercialisation retenu pour le lancement est **vente assistée avec règlement manuel** : devis/contrat, création du tenant et facture, puis confirmation du règlement et de l’échéance depuis le back-office Éditeur. Ce lancement ne comprend ni achat autonome ni encaissement Mobile Money automatisé.
 
 ## Onboarding client
 

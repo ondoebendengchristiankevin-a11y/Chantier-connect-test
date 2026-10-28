@@ -23,9 +23,14 @@ Vite sert l’interface sur le port 8443 et relaie `/api/*` vers `http://127.0.0
 
 ## Déploiement
 
-1. Déployez [backend/](backend/) sur un hébergeur Node avec `npm install`, `npm run build` et `npm start`. Configurez les variables runtime `DATABASE_URL`, `DATABASE_SSL=true`, `JWT_SECRET` (au moins 64 caractères aléatoires) et `NODE_ENV=production`. Utilisez l’URL PostgreSQL Supabase, de préférence son pooler en mode session, port 5432. Appliquez les migrations de `backend/migrations/` après vérification sur une base de recette. Le health check du backend est `/api/health`.
+1. Déployez [backend/](backend/) sur un hébergeur Node avec `npm install`, `npm run build` et `npm start`. Configurez les variables runtime `DATABASE_URL`, `DATABASE_SSL=true`, `JWT_SECRET` (au moins 64 caractères aléatoires), `MFA_ENCRYPTION_KEY` (clé Base64 aléatoire de 32 octets), `RESEND_API_KEY`, `EMAIL_FROM`, `APP_ORIGIN` (origine HTTPS publique du frontend) et `NODE_ENV=production`. Utilisez l’URL PostgreSQL Supabase, de préférence son pooler en mode session, port 5432. Appliquez les migrations de `backend/migrations/` après vérification sur une base de recette. Le health check du backend est `/api/health`.
 2. Déployez [frontend/](frontend/) sur Cloudflare Workers. `API_ORIGIN` est définie dans `frontend/wrangler.jsonc` avec l’origine HTTPS Render. Si elle change, mettez à jour cette valeur avant le déploiement. Le Worker sert les fichiers frontend et relaie `/api/*` au backend Node; il ne se connecte jamais directement à PostgreSQL.
 3. Vérifiez `https://<backend>/api/health` puis `https://<frontend>/api/health`. Les deux doivent retourner `{"status":"ok","database":"connected"}`.
+
+Le frontend est installable comme PWA. Sa coque peut s’ouvrir hors connexion,
+mais les opérations métier et les données nécessitent le backend en ligne.
+L’administrateur entreprise peut ajouter une image de couverture à chaque
+chantier; elle est privée au tenant et incluse dans son quota de stockage.
 
 `DATABASE_URL` et `JWT_SECRET` ne doivent être configurés que sur le backend. Après le basculement, supprimez les anciens secrets backend du Worker Cloudflare. `API_ORIGIN` n’est pas secret. Le proxy conserve le chemin, la query string et les cookies afin que les sessions restent same-site depuis le domaine Cloudflare.
 
@@ -39,4 +44,4 @@ L’application comprend la connexion par email/téléphone, le contrôle de rô
 
 Le [Guide d’entreprise](GUIDE-ENTREPRISE.md) décrit les rôles client, leurs espaces, leurs responsabilités et le flux recommandé entre chantier, rapports et comptabilité.
 
-**État : MVP utilisable en pilote accompagné; production commerciale générale non validée.** Le build, le smoke test des huit rôles et une simulation locale du cloisonnement entre deux entreprises ont réussi le 18 octobre 2026. Voir le compte rendu dans [tests-audits/audits/etat-pilote-2026-10-18.md](tests-audits/audits/etat-pilote-2026-10-18.md).
+**État au 28 octobre 2026 : MVP utilisable en pilote accompagné; production commerciale générale non validée.** Build backend/frontend, vérification des types du frontend/Worker, contrôle des prérequis de production et simulation isolée locale des rôles, MFA, audits, quotas et migrations réussis. L’API locale et le frontend ont répondu en HTTP 200 après application des 16 migrations. Le smoke test des comptes de démonstration n’a pas pu valider les mots de passe existants; l’Éditeur doit encore terminer son enrôlement MFA. La configuration réelle des emails et la recette de préproduction ne sont pas validées. Le [compte rendu historique du pilote](tests-audits/audits/etat-pilote-2026-10-18.md) décrit les résultats obtenus le 18 octobre.

@@ -36,6 +36,7 @@ interface UserRow {
   subscription_status?: string | null
   subscription_not_expired?: boolean
   has_profile_photo?: boolean
+  mfa_enabled_at?: Date | null
 }
 
 const sessionCookie = "cc_session"
@@ -143,6 +144,7 @@ export async function authenticate(
             u.role_label, u.tenant_id, u.tenant_name, u.tenant_plan,
             u.assigned_site, u.assigned_site_id, assigned.name AS assigned_site_name,
             u.session_version, u.requires_user_consent, u.must_change_password,
+            u.mfa_enabled_at,
             (u.sensitive_data_consented_at IS NOT NULL) AS sensitive_data_consented,
             u.sections, u.capabilities,
             t.status AS tenant_status, s.status AS subscription_status,
@@ -164,6 +166,14 @@ export async function authenticate(
 
   if (row.session_version !== sessionVersion) {
     response.status(401).json({ error: "Cette session a Ã©tÃ© rÃ©voquÃ©e." })
+    return
+  }
+
+  if (row.role === "EDITOR" && !row.mfa_enabled_at) {
+    response.status(403).json({
+      error: "L’authentification multifacteur de l’éditeur doit être configurée.",
+      code: "EDITOR_MFA_REQUIRED",
+    })
     return
   }
 
@@ -256,6 +266,39 @@ export async function authenticatePassword(
 
   if (!hasValidTenantAccess) return null
 
+  return asAuthUser(row)
+}
+
+export async function authenticateUserById(userId: string): Promise<AuthUser | null> {
+  const result = await pool.query<UserRow>(
+    `SELECT u.id, u.email, u.phone, u.full_name, u.initials,
+            u.role, u.role_label, u.tenant_id, u.tenant_name, u.tenant_plan,
+            u.assigned_site, u.assigned_site_id, assigned.name AS assigned_site_name,
+            u.session_version, u.requires_user_consent, u.must_change_password,
+            (u.sensitive_data_consented_at IS NOT NULL) AS sensitive_data_consented,
+            u.sections, u.capabilities,
+            t.status AS tenant_status, s.status AS subscription_status,
+            (s.renews_at IS NOT NULL AND s.renews_at >= CURRENT_DATE) AS subscription_not_expired,
+            (u.profile_photo_data IS NOT NULL) AS has_profile_photo,
+            u.mfa_enabled_at
+     FROM users u
+     LEFT JOIN sites assigned
+       ON assigned.id = u.assigned_site_id AND assigned.tenant_id = u.tenant_id
+     LEFT JOIN tenants t ON t.id = u.tenant_id
+     LEFT JOIN tenant_subscriptions s ON s.tenant_id = u.tenant_id
+     WHERE u.id = $1 AND u.active = true`,
+    [userId],
+  )
+  const row = result.rows[0]
+  if (!row) return null
+  const hasValidTenantAccess =
+    !row.tenant_id ||
+    ((row.tenant_status === "Actif" || row.tenant_status === "Essai") &&
+      (row.subscription_status === "Actif" || row.subscription_status === "Essai") &&
+      row.subscription_not_expired)
+  if (!hasValidTenantAccess || (row.role === "EDITOR" && !row.mfa_enabled_at)) {
+    return null
+  }
   return asAuthUser(row)
 }
 

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict"
 
+import { readFile } from "node:fs/promises"
+
 import { spawnSync } from "node:child_process"
 
 const configModule = new URL("../../dist-server/config.js", import.meta.url)
@@ -9,7 +11,14 @@ const importConfig = `import(${JSON.stringify(configModule)})`
 
 const databaseUrl = "postgresql://preflight:preflight@db.invalid:5432/preflight"
 
-function loadProductionConfig({ databaseSsl, jwtSecret }) {
+function loadProductionConfig({
+  databaseSsl,
+  jwtSecret,
+  mfaEncryptionKey,
+  resendApiKey = "re_test_key",
+  emailFrom = "Chantier Connect <no-reply@example.com>",
+  appOrigin = "https://app.example.com",
+}) {
   return spawnSync(
     process.execPath,
 
@@ -30,6 +39,14 @@ function loadProductionConfig({ databaseSsl, jwtSecret }) {
         DATABASE_SSL: databaseSsl,
 
         JWT_SECRET: jwtSecret,
+
+        MFA_ENCRYPTION_KEY: mfaEncryptionKey,
+
+        RESEND_API_KEY: resendApiKey,
+
+        EMAIL_FROM: emailFrom,
+
+        APP_ORIGIN: appOrigin,
       },
     },
   )
@@ -41,10 +58,14 @@ const secureSecret = "aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY"
 
   .slice(0, 64)
 
+const secureMfaKey = Buffer.alloc(32, 37).toString("base64")
+
 const valid = loadProductionConfig({
   databaseSsl: "true",
 
   jwtSecret: secureSecret,
+
+  mfaEncryptionKey: secureMfaKey,
 })
 
 assert.equal(
@@ -65,6 +86,8 @@ const insecureDatabase = loadProductionConfig({
   databaseSsl: "false",
 
   jwtSecret: secureSecret,
+
+  mfaEncryptionKey: secureMfaKey,
 })
 
 assert.notEqual(
@@ -86,6 +109,8 @@ const shortSecret = loadProductionConfig({
   databaseSsl: "true",
 
   jwtSecret: "short-secret",
+
+  mfaEncryptionKey: secureMfaKey,
 })
 
 assert.notEqual(
@@ -100,6 +125,8 @@ const exampleSecret = loadProductionConfig({
   databaseSsl: "true",
 
   jwtSecret: "replace-with-a-random-secret-of-at-least-32-characters",
+
+  mfaEncryptionKey: secureMfaKey,
 })
 
 assert.notEqual(
@@ -110,6 +137,58 @@ assert.notEqual(
   "La production doit refuser la clé d’exemple.",
 )
 
+const missingMfaKey = loadProductionConfig({
+  databaseSsl: "true",
+  jwtSecret: secureSecret,
+})
+assert.notEqual(
+  missingMfaKey.status,
+  0,
+  "La production doit refuser l’absence de clé de chiffrement MFA.",
+)
+
+const missingEmailConfiguration = loadProductionConfig({
+  databaseSsl: "true",
+  jwtSecret: secureSecret,
+  mfaEncryptionKey: secureMfaKey,
+  resendApiKey: "",
+  emailFrom: "",
+  appOrigin: "",
+})
+assert.notEqual(
+  missingEmailConfiguration.status,
+  0,
+  "La production doit refuser l’absence de configuration des emails de sécurité.",
+)
+
+const insecureAppOrigin = loadProductionConfig({
+  databaseSsl: "true",
+  jwtSecret: secureSecret,
+  mfaEncryptionKey: secureMfaKey,
+  appOrigin: "http://app.example.com",
+})
+assert.notEqual(
+  insecureAppOrigin.status,
+  0,
+  "La production doit refuser une origine frontend sans HTTPS.",
+)
+
+const manifest = JSON.parse(
+  await readFile(
+    new URL("../../frontend/public/manifest.webmanifest", import.meta.url),
+    "utf8",
+  ),
+)
+assert.equal(manifest.display, "standalone")
+assert.ok(manifest.icons.some((icon) => icon.sizes === "192x192"))
+assert.ok(manifest.icons.some((icon) => icon.sizes === "512x512"))
+const serviceWorker = await readFile(
+  new URL("../../frontend/public/sw.js", import.meta.url),
+  "utf8",
+)
+assert.ok(serviceWorker.includes('url.pathname.startsWith("/api/")'))
+assert.ok(serviceWorker.includes('caches.match("/index.html")'))
+
 console.info(
-  "Configuration de production : prérequis positifs et négatifs vérifiés.",
+  "Configuration de production et ressources PWA : prérequis positifs et négatifs vérifiés.",
 )

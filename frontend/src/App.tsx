@@ -35,7 +35,7 @@ import {
   type UserRole,
 } from "./lib/api"
 
-type IconName = "alert" | "arrow" | "building" | "calendar" | "camera" | "chart" | "check" | "chevron" | "clipboard" | "cloud" | "hardhat" | "home" | "lock" | "logout" | "menu" | "moon" | "pin" | "plus" | "search" | "settings" | "task" | "team" | "user" | "wallet"
+type IconName = "alert" | "arrow" | "building" | "calendar" | "camera" | "chart" | "check" | "chevron" | "clipboard" | "cloud" | "download" | "hardhat" | "home" | "lock" | "logout" | "menu" | "moon" | "pin" | "plus" | "search" | "settings" | "task" | "team" | "user" | "wallet"
 
 type ActionKind = "site" | "task" | "photo" | "report" | "member" | "payment" | "paymentReceipt" | "budget" | "treasury" | "supplierInvoice" | "supplierInvoicePayment" | "tenant" | "plan" | "ticket" | "invoice"
 
@@ -45,6 +45,11 @@ type PendingAction = {
   id?: string
   initialValues?: Record<string, string>
 } | null
+
+interface InstallPromptEvent extends Event {
+  prompt(): Promise<void>
+  userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>
+}
 
 function generateTemporaryPassword() {
   const groups = [
@@ -95,6 +100,12 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
         <path d="M12 3 2.7 19h18.6L12 3Z" />
         <path d="M12 9v4" />
         <path d="M12 16.5h.01" />
+      </>
+    ),
+    download: (
+      <>
+        <path d="M12 3v12m-5-5 5 5 5-5" />
+        <path d="M5 17v3h14v-3" />
       </>
     ),
     arrow: <path d="M5 12h14m-6-6 6 6-6 6" />,
@@ -631,6 +642,24 @@ function StandaloneLogin({
   const [confirmPassword, setConfirmPassword] = useState("")
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
+  const [mfaSetupToken, setMfaSetupToken] = useState("")
+  const [mfaChallengeToken, setMfaChallengeToken] = useState("")
+  const [mfaSetup, setMfaSetup] = useState<{
+    secret: string
+    provisioningUri: string
+  } | null>(null)
+  const [mfaCode, setMfaCode] = useState("")
+  const [usingRecoveryCode, setUsingRecoveryCode] = useState(false)
+  const [recoveryCodes, setRecoveryCodes] = useState<string[]>([])
+  const [mfaUserToContinue, setMfaUserToContinue] = useState<AuthUser | null>(null)
+
+  async function finishMfaLogin(user: AuthUser) {
+    if (user.mustChangePassword) {
+      setMustChangePassword(true)
+      return
+    }
+    await onLogin(user, rememberMe)
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -647,11 +676,37 @@ function StandaloneLogin({
         setConfirmPassword("")
         return
       }
-      const user = await api.login(identifier, password, rememberMe)
-      if (user.mustChangePassword) {
-        setMustChangePassword(true)
+      if (recoveryCodes.length > 0) {
+        return
+      }
+      if (mfaSetupToken) {
+        const result = await api.enableEditorMfa(mfaSetupToken, mfaCode)
+        setRecoveryCodes(result.recoveryCodes)
+        setMfaUserToContinue(result.user)
+        setMfaCode("")
+        return
+      }
+      if (mfaChallengeToken) {
+        const result = await api.verifyEditorMfa(
+          mfaChallengeToken,
+          usingRecoveryCode ? { recoveryCode: mfaCode } : { code: mfaCode },
+        )
+        setMfaChallengeToken("")
+        await finishMfaLogin(result.user)
       } else {
-        await onLogin(user, rememberMe)
+        const result = await api.login(identifier, password, rememberMe)
+        if ("mfaSetupRequired" in result) {
+          setMfaSetupToken(result.setupToken)
+          setMfaSetup(await api.startEditorMfaSetup(result.setupToken))
+          setPassword("")
+        } else if ("mfaRequired" in result) {
+          setMfaChallengeToken(result.challengeToken)
+          setPassword("")
+        } else if (result.user.mustChangePassword) {
+          setMustChangePassword(true)
+        } else {
+          await onLogin(result.user, rememberMe)
+        }
       }
     } catch (cause) {
       setError(
@@ -662,6 +717,16 @@ function StandaloneLogin({
     } finally {
       setLoading(false)
     }
+  }
+
+  async function continueAfterRecoveryCodes() {
+    if (!mfaUserToContinue) return
+    const user = mfaUserToContinue
+    setRecoveryCodes([])
+    setMfaUserToContinue(null)
+    setMfaSetupToken("")
+    setMfaSetup(null)
+    await finishMfaLogin(user)
   }
 
   return (
@@ -681,13 +746,31 @@ function StandaloneLogin({
         <form className="auth-page__card" onSubmit={(event) => void submit(event)}>
           <div className="landing-auth-card__heading">
             <span className="landing-eyebrow">Espace sécurisé</span>
-            <h2>{passwordChanged ? "Mot de passe modifié" : mustChangePassword ? "Sécurisez votre compte" : "Connexion"}</h2>
+            <h2>
+              {passwordChanged
+                ? "Mot de passe modifié"
+                : recoveryCodes.length > 0
+                  ? "Conservez vos codes de secours"
+                  : mustChangePassword
+                    ? "Sécurisez votre compte"
+                    : mfaSetupToken
+                      ? "Protégez votre accès éditeur"
+                      : mfaChallengeToken
+                        ? "Vérification en deux étapes"
+                        : "Connexion"}
+            </h2>
             <p>
               {passwordChanged
                 ? "Reconnectez-vous avec votre nouveau mot de passe."
-                : mustChangePassword
-                  ? "Votre mot de passe provisoire doit être remplacé avant d’accéder à la plateforme."
-                  : "Accédez à l’espace de votre entreprise."}
+                : recoveryCodes.length > 0
+                  ? "Ces codes ne seront plus affichés. Conservez-les hors de cet appareil."
+                  : mustChangePassword
+                    ? "Votre mot de passe provisoire doit être remplacé avant d’accéder à la plateforme."
+                    : mfaSetupToken
+                      ? "Ajoutez cette clé à une application TOTP, puis saisissez le code à six chiffres pour activer la MFA."
+                      : mfaChallengeToken
+                        ? "Saisissez le code à six chiffres de votre application, ou utilisez un code de secours."
+                        : "Accédez à l’espace de votre entreprise."}
             </p>
           </div>
           {passwordChanged ? (
@@ -702,6 +785,17 @@ function StandaloneLogin({
             >
               Retour à la connexion
             </button>
+          ) : recoveryCodes.length > 0 ? (
+            <div className="editor-boundary">
+              <Icon name="lock" />
+              <div>
+                <strong>Codes à usage unique</strong>
+                <p>{recoveryCodes.join(" · ")}</p>
+                <button className="primary-button" type="button" onClick={() => void continueAfterRecoveryCodes()}>
+                  J’ai enregistré mes codes
+                </button>
+              </div>
+            </div>
           ) : mustChangePassword ? (
             <>
               <label>
@@ -730,6 +824,68 @@ function StandaloneLogin({
               </label>
               <button className="text-button" type="button" onClick={() => setVisible((current) => !current)}>
                 {visible ? "Masquer les mots de passe" : "Afficher les mots de passe"}
+              </button>
+            </>
+          ) : mfaSetupToken ? (
+            <>
+              {mfaSetup && (
+                <div className="editor-boundary">
+                  <Icon name="lock" />
+                  <div>
+                    <strong>Clé de configuration</strong>
+                    <p>{mfaSetup.secret}</p>
+                    <a href={mfaSetup.provisioningUri}>Ouvrir dans une application compatible</a>
+                  </div>
+                </div>
+              )}
+              <label>
+                <span>Code de l’application</span>
+                <input
+                  autoComplete="one-time-code"
+                  inputMode="numeric"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  value={mfaCode}
+                  onChange={(event) => setMfaCode(event.target.value.replace(/\D/g, ""))}
+                  required
+                />
+              </label>
+              {error && <div className="auth-error" role="alert">{error}</div>}
+              <button className="primary-button" type="submit" disabled={loading || mfaCode.length !== 6}>
+                {loading ? "Vérification…" : "Activer la MFA"}
+              </button>
+            </>
+          ) : mfaChallengeToken ? (
+            <>
+              <label>
+                <span>{usingRecoveryCode ? "Code de secours" : "Code de l’application"}</span>
+                <input
+                  autoComplete={usingRecoveryCode ? "off" : "one-time-code"}
+                  inputMode={usingRecoveryCode ? "text" : "numeric"}
+                  maxLength={usingRecoveryCode ? 32 : 6}
+                  value={mfaCode}
+                  onChange={(event) => setMfaCode(
+                    usingRecoveryCode
+                      ? event.target.value.replace(/[^a-fA-F0-9]/g, "").toUpperCase()
+                      : event.target.value.replace(/\D/g, ""),
+                  )}
+                  required
+                />
+              </label>
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => {
+                  setUsingRecoveryCode((current) => !current)
+                  setMfaCode("")
+                  setError("")
+                }}
+              >
+                {usingRecoveryCode ? "Utiliser l’application d’authentification" : "Utiliser un code de secours"}
+              </button>
+              {error && <div className="auth-error" role="alert">{error}</div>}
+              <button className="primary-button" type="submit" disabled={loading || (usingRecoveryCode ? mfaCode.length < 16 : mfaCode.length !== 6)}>
+                {loading ? "Vérification…" : "Vérifier et continuer"}
               </button>
             </>
           ) : (
@@ -1057,6 +1213,8 @@ const auditActionLabels: Record<string, string> = {
   SUPPLIER_INVOICE_UPDATED: "Facture fournisseur modifiée",
   SUPPLIER_INVOICE_SUBMITTED: "Facture fournisseur soumise au contrôle",
   SUPPLIER_INVOICE_STATUS_CHANGED: "Statut de facture fournisseur modifié",
+  SITE_COVER_IMAGE_UPDATED: "Image du chantier modifiée",
+  SITE_COVER_IMAGE_REMOVED: "Image du chantier supprimée",
 }
 
 const actionFields: Record<ActionKind, {
@@ -1689,6 +1847,29 @@ function ActionDialog({
               )}
             </label>
           ))}
+          {action.kind === "site" && (
+            <div className="site-image-field">
+              <span>Image du chantier (JPEG, PNG ou WebP · 2 Mo max.)</span>
+              {action.initialValues?.hasImage === "true" && action.id && (
+                <img
+                  src={api.siteImageUrl(action.id)}
+                  alt={`Image actuelle de ${action.title.replace(/^Modifier /, "")}`}
+                />
+              )}
+              <input
+                name="image"
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                aria-label="Choisir une image du chantier"
+              />
+              {action.initialValues?.hasImage === "true" && (
+                <label className="site-image-field__remove">
+                  <input name="removeSiteImage" type="checkbox" />
+                  Supprimer l’image actuelle
+                </label>
+              )}
+            </div>
+          )}
           {requiredTailField && (
             <label key={requiredTailField.label}>
               <span>{requiredTailField.label}</span>
@@ -2699,6 +2880,9 @@ function ModuleView({
   >("all")
   const [platformUserRole, setPlatformUserRole] = useState<UserRole | "all">("all")
   const [platformUserTenantId, setPlatformUserTenantId] = useState("all")
+  const [newEditorName, setNewEditorName] = useState("")
+  const [newEditorEmail, setNewEditorEmail] = useState("")
+  const [creatingPlatformEditor, setCreatingPlatformEditor] = useState(false)
   const [platformUserEditTarget, setPlatformUserEditTarget] = useState<PlatformUser | null>(null)
   const [platformSupportTarget, setPlatformSupportTarget] = useState<PlatformUser | null>(null)
   const [platformUserConfirmation, setPlatformUserConfirmation] = useState<{
@@ -3488,6 +3672,42 @@ function ModuleView({
     setTemporaryPasswordTarget(userRecord)
   }
 
+  async function createPlatformEditor(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setCreatingPlatformEditor(true)
+    try {
+      const result = await api.createPlatformEditor({
+        fullName: newEditorName.trim(),
+        email: newEditorEmail.trim(),
+      })
+      setNewEditorName("")
+      setNewEditorEmail("")
+      notify(result.message)
+      onDataChange()
+    } catch (error) {
+      notify(
+        error instanceof Error
+          ? error.message
+          : "L’invitation de l’éditeur n’a pas pu être envoyée.",
+      )
+    } finally {
+      setCreatingPlatformEditor(false)
+    }
+  }
+
+  async function resendPlatformEditorInvitation(userRecord: PlatformUser) {
+    try {
+      const result = await api.sendPlatformPasswordReset(userRecord.id)
+      notify(result.message)
+    } catch (error) {
+      notify(
+        error instanceof Error
+          ? error.message
+          : "L’invitation de l’éditeur n’a pas pu être envoyée.",
+      )
+    }
+  }
+
   async function saveTemporaryPassword(userRecord: PlatformUser, temporaryPassword: string) {
     try {
       await api.setPlatformUserTemporaryPassword(userRecord.id, temporaryPassword)
@@ -3572,6 +3792,13 @@ function ModuleView({
             title={selectedSite.name}
             onClose={() => setSelectedSite(null)}
           >
+            {selectedSite.hasImage && (
+              <img
+                className="site-detail-image"
+                src={api.siteImageUrl(selectedSite.id)}
+                alt={`Vue du chantier ${selectedSite.name}`}
+              />
+            )}
             <dl className="detail-list">
               {selectedSite.description && (
                 <div className="detail-list__wide">
@@ -3691,6 +3918,7 @@ function ModuleView({
                         ? String(site.plannedDurationDays)
                         : "",
                       "Échéance prévisionnelle": site.endDate ?? "",
+                      hasImage: String(site.hasImage),
                     })
                   }}
                 >
@@ -3772,11 +4000,18 @@ function ModuleView({
                   }
                 }}
               >
-                <div className={`portfolio-card__cover cover--${tone}`}>
+                <div className={`portfolio-card__cover cover--${tone}${site.hasImage ? " portfolio-card__cover--image" : ""}`}>
+                  {site.hasImage && (
+                    <img
+                      src={api.siteImageUrl(site.id)}
+                      alt={`Vue du chantier ${site.name}`}
+                      loading="lazy"
+                    />
+                  )}
                   <span className="status-pill">
                     {site.status ?? "Non communiqué"}
                   </span>
-                  <Icon name="building" size={35} />
+                  {!site.hasImage && <Icon name="building" size={35} />}
                   <button
                     aria-label={`Ouvrir ${site.name}`}
                     onClick={(event) => {
@@ -6140,8 +6375,33 @@ function ModuleView({
         />
         <div className="editor-boundary">
           <Icon name="lock" />
-          <div><strong>Accès personnel contrôlé</strong><p>Les changements de mot de passe et révocations de session sont journalisés; un mot de passe provisoire impose un changement à la prochaine connexion.</p></div>
+          <div><strong>Accès personnel contrôlé</strong><p>Les changements de mot de passe et révocations de session sont journalisés. Chaque éditeur doit activer la MFA TOTP; l’ajout d’un second éditeur permet la continuité d’accès.</p></div>
         </div>
+        <form className="module-toolbar" onSubmit={(event) => void createPlatformEditor(event)}>
+          <input
+            aria-label="Nom du nouvel éditeur"
+            autoComplete="name"
+            placeholder="Nom du nouvel éditeur"
+            minLength={2}
+            maxLength={120}
+            value={newEditorName}
+            onChange={(event) => setNewEditorName(event.target.value)}
+            required
+          />
+          <input
+            aria-label="Email du nouvel éditeur"
+            type="email"
+            autoComplete="email"
+            placeholder="Email professionnel"
+            maxLength={254}
+            value={newEditorEmail}
+            onChange={(event) => setNewEditorEmail(event.target.value)}
+            required
+          />
+          <button className="module-primary" type="submit" disabled={creatingPlatformEditor}>
+            {creatingPlatformEditor ? "Envoi…" : "Inviter un éditeur"}
+          </button>
+        </form>
         <div className="module-toolbar">
           <div className="module-search">
             <Icon name="search" />
@@ -6192,7 +6452,9 @@ function ModuleView({
               <div className="platform-user-actions">
                 <button className="text-button" type="button" onClick={() => void editPlatformUser(platformUser)}>Modifier</button>
                 <button className="text-button" type="button" onClick={() => void openPlatformSupportAccess(platformUser)}>Mode support</button>
-                <button className="text-button" type="button" disabled={!platformUser.active || platformUser.role === "EDITOR"} onClick={() => void resetPlatformUserPassword(platformUser)}>Mot de passe provisoire</button>
+                {platformUser.role === "EDITOR"
+                  ? <button className="text-button" type="button" disabled={!platformUser.active} onClick={() => void resendPlatformEditorInvitation(platformUser)}>Réinitialiser par email</button>
+                  : <button className="text-button" type="button" disabled={!platformUser.active} onClick={() => void resetPlatformUserPassword(platformUser)}>Mot de passe provisoire</button>}
                 {platformUser.role !== "EDITOR" && platformUser.id !== user.id && <button className="text-button" type="button" disabled={!platformUser.active} onClick={() => void revokePlatformUserSessions(platformUser)}>Forcer la déconnexion</button>}
                 {platformUser.role !== "EDITOR" && platformUser.id !== user.id && <button className="text-button" type="button" onClick={() => void togglePlatformUser(platformUser)}>{platformUser.active ? "Bloquer" : "Réactiver"}</button>}
               </div>
@@ -7796,10 +8058,14 @@ function Dashboard({
   user,
   onLogout,
   onUserUpdate,
+  installPrompt,
+  onInstall,
 }: {
   user: AuthUser
   onLogout: () => Promise<void>
   onUserUpdate: (user: AuthUser) => void
+  installPrompt: InstallPromptEvent | null
+  onInstall: () => Promise<void>
 }) {
   const [active, setActive] = useState("Tableau de bord")
   const [dark, setDark] = useState(
@@ -7843,6 +8109,28 @@ function Dashboard({
     values: Record<string, string>,
   ) {
     if (action.kind === "site") {
+      if (values.imageBase64 && values.removeSiteImage === "on") {
+        throw new Error(
+          "Choisissez soit une nouvelle image, soit la suppression de l’image actuelle.",
+        )
+      }
+      let coverImage: {
+        contentType: "image/jpeg" | "image/png" | "image/webp"
+        imageBase64: string
+      } | undefined
+      if (values.imageBase64) {
+        if (
+          values.contentType !== "image/jpeg" &&
+          values.contentType !== "image/png" &&
+          values.contentType !== "image/webp"
+        ) {
+          throw new Error("Choisissez une image JPEG, PNG ou WebP.")
+        }
+        coverImage = {
+          contentType: values.contentType,
+          imageBase64: values.imageBase64,
+        }
+      }
       if (action.id) {
         await api.updateSite(action.id, {
           name: values["Nom du chantier"] ?? "",
@@ -7864,6 +8152,11 @@ function Dashboard({
             ? Number(values["Délai prévu (jours)"])
             : null,
         })
+        if (coverImage) {
+          await api.uploadSiteImage(action.id, coverImage)
+        } else if (values.removeSiteImage === "on") {
+          await api.deleteSiteImage(action.id)
+        }
       } else {
         await api.createSite({
           name: values["Nom du chantier"] ?? "",
@@ -7884,6 +8177,7 @@ function Dashboard({
           plannedDurationDays: values["Délai prévu (jours)"]
             ? Number(values["Délai prévu (jours)"])
             : null,
+          coverImage,
         })
       }
       setDataRevision((revision) => revision + 1)
@@ -8322,6 +8616,24 @@ function Dashboard({
             <p>{currentDate}</p>
           </div>
           <div className="topbar__actions">
+            {installPrompt && (
+              <button
+                className="install-app-button"
+                type="button"
+                onClick={() =>
+                  void onInstall().catch((error: unknown) =>
+                    setToast(
+                      error instanceof Error
+                        ? error.message
+                        : "L’installation n’a pas pu être lancée.",
+                    ),
+                  )
+                }
+              >
+                <Icon name="download" />
+                <span>Installer l’application</span>
+              </button>
+            )}
             <div className="connection">
               <i /> Connecté <span>• Session authentifiée</span>
             </div>
@@ -8398,6 +8710,28 @@ export default function App() {
   )
   const [authResolved, setAuthResolved] = useState(false)
   const [authError, setAuthError] = useState("")
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null)
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return
+    void navigator.serviceWorker.register("/sw.js").catch((error: unknown) => {
+      console.error("L’enregistrement de l’application hors ligne a échoué.", error)
+    })
+  }, [])
+
+  useEffect(() => {
+    const handleInstallPrompt = (event: Event) => {
+      event.preventDefault()
+      setInstallPrompt(event as InstallPromptEvent)
+    }
+    const handleInstalled = () => setInstallPrompt(null)
+    window.addEventListener("beforeinstallprompt", handleInstallPrompt)
+    window.addEventListener("appinstalled", handleInstalled)
+    return () => {
+      window.removeEventListener("beforeinstallprompt", handleInstallPrompt)
+      window.removeEventListener("appinstalled", handleInstalled)
+    }
+  }, [])
 
   useEffect(() => {
     let syncRequest = 0
@@ -8461,6 +8795,13 @@ export default function App() {
     window.localStorage.setItem("cc-session-change", crypto.randomUUID())
   }
 
+  async function installApp() {
+    if (!installPrompt) return
+    await installPrompt.prompt()
+    await installPrompt.userChoice
+    setInstallPrompt(null)
+  }
+
   if (!authResolved) {
     return (
       <main className="auth-checking" role="status">
@@ -8476,6 +8817,8 @@ export default function App() {
       user={authenticatedUser}
       onLogout={logout}
       onUserUpdate={setAuthenticatedUser}
+      installPrompt={installPrompt}
+      onInstall={installApp}
     />
     )
   }

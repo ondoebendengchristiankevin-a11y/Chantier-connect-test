@@ -22,10 +22,22 @@ import { tenantStorageCapacity } from "../storage.js"
 import {
   authenticate,
   authenticatePassword,
+  authenticateUserById,
   clearSession,
   issueSession,
   publicUser,
 } from "../auth.js"
+import {
+  createMfaChallengeToken,
+  createRecoveryCodes,
+  createTotpSecret,
+  decryptTotpSecret,
+  encryptTotpSecret,
+  hashMfaChallengeToken,
+  hashRecoveryCode,
+  provisioningUri,
+  verifyTotp,
+} from "../editor-mfa.js"
 
 const router = Router()
 
@@ -72,6 +84,40 @@ const passwordResetLimiter = rateLimit({
   message: { error: "Trop de demandes. Réessayez dans quelques minutes." },
 })
 
+const mfaLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { error: "Trop de tentatives MFA. Réessayez dans 15 minutes." },
+})
+
+async function createMfaChallenge(
+  userId: string,
+  purpose: "setup" | "login",
+  rememberMe = false,
+) {
+  const token = createMfaChallengeToken()
+  await pool.query(
+    `DELETE FROM editor_mfa_challenges
+     WHERE user_id = $1 AND consumed_at IS NULL AND expires_at <= now()`,
+    [userId],
+  )
+  await pool.query(
+    `INSERT INTO editor_mfa_challenges
+       (challenge_hash, user_id, purpose, remember_me, expires_at)
+     VALUES ($1, $2, $3, $4, now() + $5::interval)`,
+    [
+      hashMfaChallengeToken(token),
+      userId,
+      purpose,
+      rememberMe,
+      purpose === "setup" ? "10 minutes" : "5 minutes",
+    ],
+  )
+  return token
+}
+
 router.post("/password-reset/request", passwordResetLimiter, async (request, response) => {
   const parsed = z.object({ email: z.email().trim().toLowerCase() }).safeParse(request.body)
   if (!parsed.success) {
@@ -116,9 +162,9 @@ router.post("/password-reset/complete", passwordResetLimiter, async (request, re
   try {
     await client.query("BEGIN")
     const result = await client.query<{
-      user_id: string; tenant_id: string | null; active: boolean
+      user_id: string; tenant_id: string | null; active: boolean; role: string
     }>(
-      `SELECT token.user_id, u.tenant_id, u.active
+      `SELECT token.user_id, u.tenant_id, u.active, u.role
        FROM password_reset_tokens token
        JOIN users u ON u.id = token.user_id
        WHERE token.token_hash = $1 AND token.used_at IS NULL
@@ -135,10 +181,24 @@ router.post("/password-reset/complete", passwordResetLimiter, async (request, re
     const passwordHash = await bcrypt.hash(parsed.data.newPassword, 12)
     await client.query(
       `UPDATE users SET password_hash = $1, must_change_password = false,
-              session_version = session_version + 1
+              session_version = session_version + 1,
+              mfa_secret_encrypted = CASE WHEN role = 'EDITOR' THEN NULL ELSE mfa_secret_encrypted END,
+              mfa_pending_secret_encrypted = CASE WHEN role = 'EDITOR' THEN NULL ELSE mfa_pending_secret_encrypted END,
+              mfa_enabled_at = CASE WHEN role = 'EDITOR' THEN NULL ELSE mfa_enabled_at END
        WHERE id = $2 AND active = true`,
       [passwordHash, reset.user_id],
     )
+    if (reset.role === "EDITOR") {
+      await client.query(
+        "DELETE FROM editor_mfa_recovery_codes WHERE user_id = $1",
+        [reset.user_id],
+      )
+      await client.query(
+        `UPDATE editor_mfa_challenges SET consumed_at = now()
+         WHERE user_id = $1 AND consumed_at IS NULL`,
+        [reset.user_id],
+      )
+    }
     await client.query(
       `UPDATE password_reset_tokens SET used_at = now()
        WHERE user_id = $1 AND used_at IS NULL`,
@@ -152,6 +212,16 @@ router.post("/password-reset/complete", passwordResetLimiter, async (request, re
       targetId: reset.user_id,
       action: "PASSWORD_RESET_COMPLETED",
     })
+    if (reset.role === "EDITOR") {
+      await writeAuditLog(client, request, {
+        actorId: reset.user_id,
+        actorRole: "SELF_SERVICE",
+        tenantId: null,
+        targetType: "user",
+        targetId: reset.user_id,
+        action: "EDITOR_MFA_RESET_BY_PASSWORD_RECOVERY",
+      })
+    }
     await client.query("COMMIT")
     response.status(204).end()
   } catch (error) {
@@ -221,8 +291,284 @@ router.post("/login", loginLimiter, async (request, response) => {
     return
   }
 
+  if (user.role === "EDITOR") {
+    const mfaState = await pool.query<{
+      mfa_secret_encrypted: string | null
+      mfa_enabled_at: Date | null
+    }>(
+      `SELECT mfa_secret_encrypted, mfa_enabled_at
+       FROM users WHERE id = $1 AND active = true`,
+      [user.id],
+    )
+    const enabled = Boolean(
+      mfaState.rows[0]?.mfa_secret_encrypted &&
+      mfaState.rows[0]?.mfa_enabled_at,
+    )
+    const challengeToken = await createMfaChallenge(
+      user.id,
+      enabled ? "login" : "setup",
+      parsed.data.rememberMe,
+    )
+    response.json(
+      enabled
+        ? { mfaRequired: true, challengeToken }
+        : { mfaSetupRequired: true, setupToken: challengeToken },
+    )
+    return
+  }
+
   issueSession(response, user, parsed.data.rememberMe)
 
+  response.json({ user: publicUser(user) })
+})
+
+const mfaSetupTokenSchema = z.object({
+  setupToken: z.string().min(32).max(128),
+})
+
+router.post("/mfa/setup", mfaLimiter, async (request, response) => {
+  const parsed = mfaSetupTokenSchema.safeParse(request.body)
+  if (!parsed.success) {
+    response.status(400).json({ error: "Jeton de configuration invalide." })
+    return
+  }
+  const client = await pool.connect()
+  let secret: string
+  let email: string
+  let userId: string
+  try {
+    await client.query("BEGIN")
+    const challenge = await client.query<{
+      id: string
+      user_id: string
+      email: string
+    }>(
+      `SELECT challenge.id, account.id AS user_id, account.email
+       FROM editor_mfa_challenges challenge
+       JOIN users account ON account.id = challenge.user_id
+       WHERE challenge.challenge_hash = $1 AND challenge.purpose = 'setup'
+         AND challenge.consumed_at IS NULL AND challenge.expires_at > now()
+         AND account.active = true AND account.role = 'EDITOR'
+         AND account.mfa_enabled_at IS NULL AND account.mfa_secret_encrypted IS NULL
+       FOR UPDATE OF challenge, account`,
+      [hashMfaChallengeToken(parsed.data.setupToken)],
+    )
+    const current = challenge.rows[0]
+    if (!current) {
+      await client.query("ROLLBACK")
+      response.status(400).json({ error: "Jeton de configuration invalide ou expiré." })
+      return
+    }
+    secret = createTotpSecret()
+    email = current.email
+    userId = current.user_id
+    await client.query(
+      `UPDATE users SET mfa_pending_secret_encrypted = $1
+       WHERE id = $2 AND active = true AND role = 'EDITOR'
+         AND mfa_enabled_at IS NULL AND mfa_secret_encrypted IS NULL`,
+      [encryptTotpSecret(secret), userId],
+    )
+    await writeAuditLog(client, request, {
+      actorId: userId,
+      actorRole: "EDITOR",
+      targetType: "user",
+      targetId: userId,
+      action: "EDITOR_MFA_SETUP_STARTED",
+    })
+    await client.query("COMMIT")
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
+  }
+  response.setHeader("Cache-Control", "no-store")
+  response.json({
+    data: { secret, provisioningUri: provisioningUri(secret, email) },
+  })
+})
+
+router.post("/mfa/enable", mfaLimiter, async (request, response) => {
+  const parsed = mfaSetupTokenSchema.extend({
+    code: z.string().regex(/^\d{6}$/),
+  }).safeParse(request.body)
+  if (!parsed.success) {
+    response.status(400).json({ error: "Code de vérification invalide." })
+    return
+  }
+  const client = await pool.connect()
+  let userId: string
+  let rememberMe: boolean
+  let recoveryCodes: string[]
+  try {
+    await client.query("BEGIN")
+    const challenge = await client.query<{
+      id: string
+      user_id: string
+      remember_me: boolean
+      mfa_pending_secret_encrypted: string | null
+    }>(
+      `SELECT challenge.id, challenge.user_id, challenge.remember_me,
+              account.mfa_pending_secret_encrypted
+       FROM editor_mfa_challenges challenge
+       JOIN users account ON account.id = challenge.user_id
+       WHERE challenge.challenge_hash = $1 AND challenge.purpose = 'setup'
+         AND challenge.consumed_at IS NULL AND challenge.expires_at > now()
+         AND account.active = true AND account.role = 'EDITOR'
+         AND account.mfa_enabled_at IS NULL AND account.mfa_secret_encrypted IS NULL
+       FOR UPDATE OF challenge, account`,
+      [hashMfaChallengeToken(parsed.data.setupToken)],
+    )
+    const current = challenge.rows[0]
+    if (!current?.mfa_pending_secret_encrypted) {
+      await client.query("ROLLBACK")
+      response.status(400).json({ error: "Configuration MFA absente ou expirée." })
+      return
+    }
+    const secret = decryptTotpSecret(current.mfa_pending_secret_encrypted)
+    if (!verifyTotp(secret, parsed.data.code)) {
+      await client.query("ROLLBACK")
+      response.status(401).json({ error: "Code d’authentification incorrect." })
+      return
+    }
+    userId = current.user_id
+    rememberMe = current.remember_me
+    recoveryCodes = createRecoveryCodes()
+    await client.query(
+      `UPDATE users
+       SET mfa_secret_encrypted = mfa_pending_secret_encrypted,
+           mfa_pending_secret_encrypted = NULL, mfa_enabled_at = now()
+       WHERE id = $1`,
+      [userId],
+    )
+    for (const code of recoveryCodes) {
+      await client.query(
+        `INSERT INTO editor_mfa_recovery_codes (user_id, code_hash)
+         VALUES ($1, $2)`,
+        [userId, hashRecoveryCode(code)],
+      )
+    }
+    await client.query(
+      `UPDATE editor_mfa_challenges SET consumed_at = now()
+       WHERE user_id = $1 AND purpose = 'setup' AND consumed_at IS NULL`,
+      [userId],
+    )
+    await writeAuditLog(client, request, {
+      actorId: userId,
+      actorRole: "EDITOR",
+      targetType: "user",
+      targetId: userId,
+      action: "EDITOR_MFA_ENABLED",
+      payloadMasked: { recoveryCodesIssued: recoveryCodes.length },
+    })
+    await client.query("COMMIT")
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
+  }
+  const user = await authenticateUserById(userId)
+  if (!user) {
+    response.status(401).json({ error: "Le compte éditeur n’est plus disponible." })
+    return
+  }
+  issueSession(response, user, rememberMe)
+  response.setHeader("Cache-Control", "no-store")
+  response.json({ user: publicUser(user), recoveryCodes })
+})
+
+router.post("/mfa/verify", mfaLimiter, async (request, response) => {
+  const parsed = z.object({
+    challengeToken: z.string().min(32).max(128),
+    code: z.string().regex(/^\d{6}$/).optional(),
+    recoveryCode: z.string().min(16).max(32).optional(),
+  }).refine((value) => Boolean(value.code) !== Boolean(value.recoveryCode)).safeParse(request.body)
+  if (!parsed.success) {
+    response.status(400).json({ error: "Code MFA ou code de secours invalide." })
+    return
+  }
+  const client = await pool.connect()
+  let userId: string
+  let rememberMe: boolean
+  let usedRecoveryCode = false
+  try {
+    await client.query("BEGIN")
+    const challenge = await client.query<{
+      id: string
+      user_id: string
+      remember_me: boolean
+      mfa_secret_encrypted: string | null
+    }>(
+      `SELECT challenge.id, challenge.user_id, challenge.remember_me,
+              account.mfa_secret_encrypted
+       FROM editor_mfa_challenges challenge
+       JOIN users account ON account.id = challenge.user_id
+       WHERE challenge.challenge_hash = $1 AND challenge.purpose = 'login'
+         AND challenge.consumed_at IS NULL AND challenge.expires_at > now()
+         AND account.active = true AND account.role = 'EDITOR'
+         AND account.mfa_enabled_at IS NOT NULL
+       FOR UPDATE OF challenge, account`,
+      [hashMfaChallengeToken(parsed.data.challengeToken)],
+    )
+    const current = challenge.rows[0]
+    if (!current?.mfa_secret_encrypted) {
+      await client.query("ROLLBACK")
+      response.status(400).json({ error: "Défi MFA invalide ou expiré." })
+      return
+    }
+    if (parsed.data.code) {
+      if (!verifyTotp(decryptTotpSecret(current.mfa_secret_encrypted), parsed.data.code)) {
+        await client.query("ROLLBACK")
+        response.status(401).json({ error: "Code d’authentification incorrect." })
+        return
+      }
+    } else {
+      const codeHash = hashRecoveryCode(parsed.data.recoveryCode!)
+      const recovery = await client.query(
+        `SELECT code_hash FROM editor_mfa_recovery_codes
+         WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL
+         FOR UPDATE`,
+        [current.user_id, codeHash],
+      )
+      if (!recovery.rowCount) {
+        await client.query("ROLLBACK")
+        response.status(401).json({ error: "Code de secours invalide ou déjà utilisé." })
+        return
+      }
+      await client.query(
+        `UPDATE editor_mfa_recovery_codes SET used_at = now()
+         WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL`,
+        [current.user_id, codeHash],
+      )
+      usedRecoveryCode = true
+    }
+    await client.query(
+      "UPDATE editor_mfa_challenges SET consumed_at = now() WHERE id = $1",
+      [current.id],
+    )
+    userId = current.user_id
+    rememberMe = current.remember_me
+    await writeAuditLog(client, request, {
+      actorId: userId,
+      actorRole: "EDITOR",
+      targetType: "user",
+      targetId: userId,
+      action: usedRecoveryCode ? "EDITOR_MFA_RECOVERY_CODE_USED" : "EDITOR_MFA_LOGIN",
+    })
+    await client.query("COMMIT")
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  } finally {
+    client.release()
+  }
+  const user = await authenticateUserById(userId)
+  if (!user) {
+    response.status(401).json({ error: "Le compte éditeur n’est plus disponible." })
+    return
+  }
+  issueSession(response, user, rememberMe)
   response.json({ user: publicUser(user) })
 })
 

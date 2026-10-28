@@ -46,6 +46,8 @@ let databaseCreated = false
 
 let apiProcess
 
+let apiOutput = ""
+
 let temporaryClient
 
 async function findAvailablePort() {
@@ -70,9 +72,9 @@ async function waitForApi(baseUrl) {
   const deadline = Date.now() + 15_000
 
   while (Date.now() < deadline) {
-    if (apiProcess.exitCode !== null) {
+    if (apiProcess.exitCode !== null || apiProcess.signalCode !== null) {
       throw new Error(
-        `L’API de recette s’est arrêtée (${apiProcess.exitCode}).`,
+        `L’API de recette s’est arrêtée (${apiProcess.exitCode ?? apiProcess.signalCode}).\n${apiOutput}`,
       )
     }
 
@@ -90,12 +92,15 @@ async function waitForApi(baseUrl) {
 
         return
       }
+      apiOutput += `Vérification /api/health: HTTP ${response.status}.\n`
     } catch {
       await new Promise((resolve) => setTimeout(resolve, 250))
     }
   }
 
-  throw new Error("L’API temporaire n’est pas devenue disponible à temps.")
+  throw new Error(
+    `L’API temporaire n’est pas devenue disponible à temps.\n${apiOutput}`,
+  )
 }
 
 async function waitForApiExit(timeoutMs) {
@@ -115,13 +120,21 @@ async function request(baseUrl, endpoint, options = {}, cookie) {
 
   if (cookie) headers.set("Cookie", cookie)
 
-  const response = await fetch(new URL(endpoint, baseUrl), {
-    ...options,
+  let response
+  try {
+    response = await fetch(new URL(endpoint, baseUrl), {
+      ...options,
 
-    headers,
+      headers,
 
-    signal: AbortSignal.timeout(5000),
-  })
+      signal: AbortSignal.timeout(15_000),
+    })
+  } catch (error) {
+    throw new Error(
+      `${options.method ?? "GET"} ${endpoint} a échoué.\n${apiOutput}`,
+      { cause: error },
+    )
+  }
 
   let body
 
@@ -136,8 +149,18 @@ async function request(baseUrl, endpoint, options = {}, cookie) {
   return { response, body }
 }
 
+async function requestRaw(baseUrl, endpoint, options = {}, cookie) {
+  const headers = new Headers(options.headers)
+  if (cookie) headers.set("Cookie", cookie)
+  return fetch(new URL(endpoint, baseUrl), {
+    ...options,
+    headers,
+    signal: AbortSignal.timeout(15_000),
+  })
+}
+
 async function login(baseUrl, email, password, expectedRole = "ADMIN_ENTERPRISE") {
-  const { response, body } = await request(baseUrl, "/api/auth/login", {
+  let { response, body } = await request(baseUrl, "/api/auth/login", {
     method: "POST",
 
     headers: { "Content-Type": "application/json" },
@@ -145,7 +168,54 @@ async function login(baseUrl, email, password, expectedRole = "ADMIN_ENTERPRISE"
     body: JSON.stringify({ identifier: email, password, rememberMe: false }),
   })
 
-  assert.equal(response.status, 200, `Échec de connexion pour ${email}.`)
+  assert.equal(
+    response.status,
+    200,
+    `Échec de connexion pour ${email}: ${JSON.stringify(body)}\n${apiOutput}`,
+  )
+
+  if (body.mfaSetupRequired) {
+    const setup = await request(baseUrl, "/api/auth/mfa/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ setupToken: body.setupToken }),
+    })
+    assert.equal(
+      setup.response.status,
+      200,
+      `Échec de l’initialisation MFA: ${JSON.stringify(setup.body)}\n${apiOutput}`,
+    )
+    globalThis.editorMfaTestSecret = setup.body.data.secret
+    const enabled = await request(baseUrl, "/api/auth/mfa/enable", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        setupToken: body.setupToken,
+        code: globalThis.editorMfaTestTools.currentTotpCode(
+          globalThis.editorMfaTestSecret,
+        ),
+      }),
+    })
+    assert.equal(enabled.response.status, 200)
+    body = enabled.body
+    response = enabled.response
+    globalThis.editorMfaRecoveryCodes = body.recoveryCodes
+  } else if (body.mfaRequired) {
+    assert.ok(globalThis.editorMfaTestSecret, "Clé MFA de recette introuvable.")
+    const verified = await request(baseUrl, "/api/auth/mfa/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        challengeToken: body.challengeToken,
+        code: globalThis.editorMfaTestTools.currentTotpCode(
+          globalThis.editorMfaTestSecret,
+        ),
+      }),
+    })
+    assert.equal(verified.response.status, 200, "La vérification TOTP a échoué.")
+    body = verified.body
+    response = verified.response
+  }
 
   assert.equal(body.user.role, expectedRole)
 
@@ -387,6 +457,12 @@ try {
     JWT_SECRET: randomBytes(64).toString("base64url"),
   }
 
+  process.env.NODE_ENV = "test"
+  process.env.DATABASE_URL = temporaryUrl.href
+  process.env.DATABASE_SSL = testEnvironment.DATABASE_SSL
+  process.env.JWT_SECRET = testEnvironment.JWT_SECRET
+  globalThis.editorMfaTestTools = await import("../../dist-server/editor-mfa.js")
+
   apiProcess = spawn(
     process.execPath,
 
@@ -397,9 +473,16 @@ try {
 
       env: testEnvironment,
 
-      stdio: "inherit",
+      stdio: ["ignore", "pipe", "pipe"],
     },
   )
+
+  apiProcess.stdout.on("data", (chunk) => {
+    apiOutput = `${apiOutput}${chunk.toString()}`.slice(-8000)
+  })
+  apiProcess.stderr.on("data", (chunk) => {
+    apiOutput = `${apiOutput}${chunk.toString()}`.slice(-8000)
+  })
 
   await waitForApi(baseUrl)
 
@@ -414,6 +497,79 @@ try {
     fixturePassword,
     "EDITOR",
   )
+  const replayChallenge = await request(baseUrl, "/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      identifier: editorEmail,
+      password: fixturePassword,
+      rememberMe: false,
+    }),
+  })
+  assert.equal(replayChallenge.response.status, 200)
+  assert.equal(replayChallenge.body.mfaRequired, true)
+  const verifyChallenge = {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      challengeToken: replayChallenge.body.challengeToken,
+      code: globalThis.editorMfaTestTools.currentTotpCode(
+        globalThis.editorMfaTestSecret,
+      ),
+    }),
+  }
+  const verifiedChallenge = await request(
+    baseUrl,
+    "/api/auth/mfa/verify",
+    verifyChallenge,
+  )
+  assert.equal(verifiedChallenge.response.status, 200)
+  const replayedChallenge = await request(
+    baseUrl,
+    "/api/auth/mfa/verify",
+    verifyChallenge,
+  )
+  assert.equal(replayedChallenge.response.status, 400)
+  const recoveryChallenge = await request(baseUrl, "/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      identifier: editorEmail,
+      password: fixturePassword,
+      rememberMe: false,
+    }),
+  })
+  assert.equal(recoveryChallenge.body.mfaRequired, true)
+  const recoveryCode = globalThis.editorMfaRecoveryCodes[0]
+  const useRecoveryCode = await request(baseUrl, "/api/auth/mfa/verify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      challengeToken: recoveryChallenge.body.challengeToken,
+      recoveryCode,
+    }),
+  })
+  assert.equal(useRecoveryCode.response.status, 200)
+  const reusedRecoveryChallenge = await request(baseUrl, "/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      identifier: editorEmail,
+      password: fixturePassword,
+      rememberMe: false,
+    }),
+  })
+  assert.equal(reusedRecoveryChallenge.body.mfaRequired, true)
+  const reusedRecoveryCode = await request(baseUrl, "/api/auth/mfa/verify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      challengeToken: reusedRecoveryChallenge.body.challengeToken,
+      recoveryCode,
+    }),
+  })
+  assert.equal(reusedRecoveryCode.response.status, 401)
+  console.info("OK MFA éditeur : enrôlement obligatoire, défi à usage unique et codes de secours à usage unique.")
 
   assert.notEqual(
     sessions[0].user.tenantId,
@@ -575,6 +731,57 @@ try {
   assert.equal(moSiteVisibility.body.data.length, 1)
   assert.equal(moSiteVisibility.body.data[0].costBudgetFcfa, null)
   assert.equal(moSiteVisibility.body.data[0].contractAmountFcfa, null)
+  const siteCoverImage = await request(
+    baseUrl,
+    `/api/sites/${roleSiteId}/image`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contentType: "image/png",
+        imageBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/wioAAAAASUVORK5CYII=",
+      }),
+    },
+    sessions[0].cookie,
+  )
+  assert.equal(siteCoverImage.response.status, 204)
+  const moSiteCoverImage = await requestRaw(
+    baseUrl,
+    `/api/sites/${roleSiteId}/image`,
+    {},
+    roleSessions.get("MAITRE_OUVRAGE").cookie,
+  )
+  assert.equal(moSiteCoverImage.status, 200)
+  assert.equal(moSiteCoverImage.headers.get("content-type"), "image/png")
+  assert.ok((await moSiteCoverImage.arrayBuffer()).byteLength > 0)
+  const otherTenantSiteCoverImage = await request(
+    baseUrl,
+    `/api/sites/${roleSiteId}/image`,
+    {},
+    sessions[1].cookie,
+  )
+  assert.equal(otherTenantSiteCoverImage.response.status, 404)
+  const moCannotUploadSiteCoverImage = await request(
+    baseUrl,
+    `/api/sites/${roleSiteId}/image`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contentType: "image/png",
+        imageBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/wioAAAAASUVORK5CYII=",
+      }),
+    },
+    roleSessions.get("MAITRE_OUVRAGE").cookie,
+  )
+  assert.equal(moCannotUploadSiteCoverImage.response.status, 403)
+  const removeSiteCoverImage = await request(
+    baseUrl,
+    `/api/sites/${roleSiteId}/image`,
+    { method: "DELETE" },
+    sessions[0].cookie,
+  )
+  assert.equal(removeSiteCoverImage.response.status, 204)
   assert.equal(
     roleSessions.get("ADMIN_ENTERPRISE").user.capabilities.includes("manage_finance"),
     false,
@@ -1779,6 +1986,242 @@ try {
   assert.equal(laterPartialPlanUpdate.body.data.maxStorageMb, 1)
   console.info("OK plan : un PATCH partiel préserve les champs absents.")
 
+  const auditedPlanName = `Recette ${randomUUID()}`
+  const createdPlan = await request(baseUrl, "/api/platform/plans", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: auditedPlanName,
+      monthlyPriceFcfa: 12000,
+      maxUsers: 2,
+      maxSites: 2,
+      maxStorageMb: 20,
+    }),
+  }, editorSession.cookie)
+  assert.equal(createdPlan.response.status, 201)
+  const planCreationAudit = await request(
+    baseUrl,
+    "/api/platform/audit-logs?action=SUBSCRIPTION_PLAN_CREATED",
+    {},
+    editorSession.cookie,
+  )
+  assert.ok(planCreationAudit.body.data.some((entry) => entry.targetId === createdPlan.body.data.id))
+
+  const today = new Date().toISOString().slice(0, 10)
+  const dueAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10)
+  const platformInvoice = await request(baseUrl, "/api/platform/invoices", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      tenantId: fixtureTenants[0].id,
+      description: "Abonnement de recette",
+      amountFcfa: 15000,
+      issuedAt: today,
+      dueAt,
+    }),
+  }, editorSession.cookie)
+  assert.equal(platformInvoice.response.status, 201)
+  const invoiceCreationAudit = await request(
+    baseUrl,
+    `/api/platform/audit-logs?tenantId=${fixtureTenants[0].id}&action=PLATFORM_INVOICE_CREATED`,
+    {},
+    editorSession.cookie,
+  )
+  assert.ok(invoiceCreationAudit.body.data.some(
+    (entry) => entry.targetId === platformInvoice.body.data.id,
+  ))
+  const paidInvoice = await request(
+    baseUrl,
+    `/api/platform/invoices/${platformInvoice.body.data.id}/status`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        status: "Payée",
+        paymentMethod: "Virement bancaire",
+        paymentReference: "RECETTE-PAIEMENT-01",
+      }),
+    },
+    editorSession.cookie,
+  )
+  assert.equal(paidInvoice.response.status, 200)
+  const invoiceSettlementAudit = await request(
+    baseUrl,
+    `/api/platform/audit-logs?tenantId=${fixtureTenants[0].id}&action=PLATFORM_INVOICE_MARKED_PAID`,
+    {},
+    editorSession.cookie,
+  )
+  assert.ok(invoiceSettlementAudit.body.data.some(
+    (entry) => entry.targetId === platformInvoice.body.data.id,
+  ))
+
+  const platformTicket = await request(baseUrl, "/api/platform/tickets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      tenantId: fixtureTenants[0].id,
+      subject: "Ticket d’audit de recette",
+      description: "Vérification de la traçabilité.",
+      priority: "Normale",
+    }),
+  }, editorSession.cookie)
+  assert.equal(platformTicket.response.status, 201)
+  const ticketStatus = await request(
+    baseUrl,
+    `/api/platform/tickets/${platformTicket.body.data.id}/status`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "En cours" }),
+    },
+    editorSession.cookie,
+  )
+  assert.equal(ticketStatus.response.status, 200)
+  const ticketAudit = await request(
+    baseUrl,
+    `/api/platform/audit-logs?tenantId=${fixtureTenants[0].id}&action=SUPPORT_TICKET_STATUS_UPDATED`,
+    {},
+    editorSession.cookie,
+  )
+  assert.ok(ticketAudit.body.data.some(
+    (entry) => entry.targetId === platformTicket.body.data.id,
+  ))
+
+  const platformSettings = await request(
+    baseUrl,
+    "/api/platform/settings",
+    {},
+    editorSession.cookie,
+  )
+  assert.equal(platformSettings.response.status, 200)
+  const settingsUpdate = await request(
+    baseUrl,
+    "/api/platform/settings",
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(platformSettings.body.data),
+    },
+    editorSession.cookie,
+  )
+  assert.equal(settingsUpdate.response.status, 200)
+  const settingsAudit = await request(
+    baseUrl,
+    "/api/platform/audit-logs?action=PLATFORM_SETTINGS_UPDATED",
+    {},
+    editorSession.cookie,
+  )
+  assert.ok(settingsAudit.body.data.some((entry) => entry.targetId === "singleton"))
+  console.info("OK audit : création de plan, factures/règlements, tickets et réglages plateforme journalisés.")
+
+  const quotaPlan = await temporaryClient.query(
+    "SELECT id FROM subscription_plans WHERE name = 'Plan PME'",
+  )
+  const currentUserCount = await temporaryClient.query(
+    "SELECT count(*)::int AS count FROM users WHERE tenant_id = $1 AND active",
+    [fixtureTenants[0].id],
+  )
+  await temporaryClient.query(
+    "UPDATE subscription_plans SET max_users = $1 WHERE id = $2",
+    [currentUserCount.rows[0].count, quotaPlan.rows[0].id],
+  )
+  const quotaMember = {
+    fullName: "Quota utilisateur test",
+    email: `quota-user-${randomUUID()}@example.invalid`,
+    role: "COMPAGNON",
+    assignedSiteId: roleSiteId,
+    temporaryPassword: randomBytes(18).toString("base64url"),
+  }
+  const userAtLimit = await request(
+    baseUrl,
+    "/api/team",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(quotaMember),
+    },
+    sessions[0].cookie,
+  )
+  assert.equal(userAtLimit.response.status, 409)
+  await temporaryClient.query(
+    "UPDATE subscription_plans SET max_users = $1 WHERE id = $2",
+    [currentUserCount.rows[0].count + 1, quotaPlan.rows[0].id],
+  )
+  const userBelowLimit = await request(
+    baseUrl,
+    "/api/team",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(quotaMember),
+    },
+    sessions[0].cookie,
+  )
+  assert.equal(userBelowLimit.response.status, 201)
+  const updatedUserCount = await temporaryClient.query(
+    "SELECT count(*)::int AS count FROM users WHERE tenant_id = $1 AND active",
+    [fixtureTenants[0].id],
+  )
+  await temporaryClient.query(
+    "UPDATE subscription_plans SET max_users = $1 WHERE id = $2",
+    [updatedUserCount.rows[0].count, quotaPlan.rows[0].id],
+  )
+  const nextUserAtLimit = await request(
+    baseUrl,
+    "/api/team",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...quotaMember,
+        email: `quota-user-${randomUUID()}@example.invalid`,
+      }),
+    },
+    sessions[0].cookie,
+  )
+  assert.equal(nextUserAtLimit.response.status, 409)
+
+  const currentSiteCount = await temporaryClient.query(
+    "SELECT count(*)::int AS count FROM sites WHERE tenant_id = $1 AND status <> 'Archivé'",
+    [fixtureTenants[0].id],
+  )
+  await temporaryClient.query(
+    "UPDATE subscription_plans SET max_sites = $1 WHERE id = $2",
+    [currentSiteCount.rows[0].count, quotaPlan.rows[0].id],
+  )
+  const createQuotaSite = (name) =>
+    request(
+      baseUrl,
+      "/api/sites",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, location: "Recette locale" }),
+      },
+      sessions[0].cookie,
+    )
+  const siteAtLimit = await createQuotaSite(`Quota ${randomUUID()}`)
+  assert.equal(siteAtLimit.response.status, 409)
+  await temporaryClient.query(
+    "UPDATE subscription_plans SET max_sites = $1 WHERE id = $2",
+    [currentSiteCount.rows[0].count + 1, quotaPlan.rows[0].id],
+  )
+  const siteBelowLimit = await createQuotaSite(`Quota ${randomUUID()}`)
+  assert.equal(siteBelowLimit.response.status, 201)
+  const updatedSiteCount = await temporaryClient.query(
+    "SELECT count(*)::int AS count FROM sites WHERE tenant_id = $1 AND status <> 'Archivé'",
+    [fixtureTenants[0].id],
+  )
+  await temporaryClient.query(
+    "UPDATE subscription_plans SET max_sites = $1 WHERE id = $2",
+    [updatedSiteCount.rows[0].count, quotaPlan.rows[0].id],
+  )
+  const nextSiteAtLimit = await createQuotaSite(`Quota ${randomUUID()}`)
+  assert.equal(nextSiteAtLimit.response.status, 409)
+  console.info("OK quotas : utilisateurs et chantiers refusés à la limite, acceptés sous la limite.")
+
   const registrationRequestId = randomUUID()
   const registrationPhone = `+241${randomBytes(4).toString("hex")}`
   const convertedEmail = `converted-${randomUUID()}@example.invalid`
@@ -1790,6 +2233,26 @@ try {
        $2, $3, 'Demande de création utilisée pour la recette.', now())`,
     [registrationRequestId, convertedEmail, registrationPhone],
   )
+  const registrationReview = await request(
+    baseUrl,
+    `/api/platform/registration-requests/${registrationRequestId}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "En cours" }),
+    },
+    editorSession.cookie,
+  )
+  assert.equal(registrationReview.response.status, 200)
+  const registrationReviewAudit = await request(
+    baseUrl,
+    "/api/platform/audit-logs?action=REGISTRATION_REQUEST_STATUS_UPDATED",
+    {},
+    editorSession.cookie,
+  )
+  assert.ok(registrationReviewAudit.body.data.some(
+    (entry) => entry.targetId === registrationRequestId,
+  ))
   const conversion = await request(
     baseUrl,
     "/api/platform/tenants",
@@ -1890,11 +2353,24 @@ try {
       body: JSON.stringify({
         name: "Chantier client recette",
         location: "Libreville",
+        coverImage: {
+          contentType: "image/png",
+          imageBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/wioAAAAASUVORK5CYII=",
+        },
       }),
     },
     clientAdminSession.cookie,
   )
   assert.equal(clientSite.response.status, 201)
+  assert.equal(clientSite.body.data.hasImage, true)
+  const createdSiteImage = await requestRaw(
+    baseUrl,
+    `/api/sites/${clientSite.body.data.id}/image`,
+    {},
+    clientAdminSession.cookie,
+  )
+  assert.equal(createdSiteImage.status, 200)
+  assert.equal(createdSiteImage.headers.get("content-type"), "image/png")
   const signatureOnlyPng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
   const acceptedQuotaPhoto = await request(
     baseUrl,
@@ -2316,6 +2792,52 @@ try {
     false,
   )
   console.info("OK mot de passe provisoire : changement obligatoire, blocage des routes, révocation et audit sans secret.")
+
+  const editorRecoveryToken = randomBytes(32).toString("base64url")
+  await temporaryClient.query(
+    `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+     VALUES ($1, $2, now() + interval '30 minutes')`,
+    [
+      editorId,
+      createHash("sha256").update(editorRecoveryToken).digest("hex"),
+    ],
+  )
+  const editorRecoveryPassword = randomBytes(18).toString("base64url")
+  const editorRecovery = await request(baseUrl, "/api/auth/password-reset/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      token: editorRecoveryToken,
+      newPassword: editorRecoveryPassword,
+    }),
+  })
+  assert.equal(editorRecovery.response.status, 204)
+  assert.equal(
+    (await request(baseUrl, "/api/auth/me", {}, editorSession.cookie)).response.status,
+    401,
+  )
+  const editorNeedsMfaSetup = await request(baseUrl, "/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      identifier: editorEmail,
+      password: editorRecoveryPassword,
+      rememberMe: false,
+    }),
+  })
+  assert.equal(editorNeedsMfaSetup.response.status, 200)
+  assert.equal(editorNeedsMfaSetup.body.mfaSetupRequired, true)
+  const clearedEditorMfa = await temporaryClient.query(
+    `SELECT mfa_secret_encrypted, mfa_enabled_at,
+            (SELECT count(*)::int FROM editor_mfa_recovery_codes
+             WHERE user_id = users.id) AS recovery_count
+     FROM users WHERE id = $1`,
+    [editorId],
+  )
+  assert.equal(clearedEditorMfa.rows[0].mfa_secret_encrypted, null)
+  assert.equal(clearedEditorMfa.rows[0].mfa_enabled_at, null)
+  assert.equal(clearedEditorMfa.rows[0].recovery_count, 0)
+  console.info("OK récupération Éditeur : reset email révoque les sessions, efface les codes et impose un nouvel enrôlement MFA.")
 
   const site = siteResults[0].body.data[0]
   const archivedSite = await request(
