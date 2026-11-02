@@ -19,7 +19,7 @@ const environmentSchema = z.object({
 
   JWT_SECRET: z
     .string()
-    .min(32, "JWT_SECRET doit contenir au moins 32 caractères."),
+    .min(64, "JWT_SECRET doit contenir au moins 64 caractères aléatoires."),
 
   MFA_ENCRYPTION_KEY: z.preprocess(
     (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
@@ -29,9 +29,27 @@ const environmentSchema = z.object({
     }, "MFA_ENCRYPTION_KEY doit être une clé Base64 aléatoire de 32 octets.").optional(),
   ),
 
+  EMAIL_PROVIDER: z.enum(["gmail", "resend"]).default("resend"),
+
   RESEND_API_KEY: z.preprocess(
     (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
     z.string().trim().min(1).optional(),
+  ),
+
+  GMAIL_USER: z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z.email().trim().toLowerCase().optional(),
+  ),
+
+  GMAIL_APP_PASSWORD: z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z.string()
+      .trim()
+      .refine(
+        (value) => value.replace(/\s/g, "").length === 16,
+        "GMAIL_APP_PASSWORD doit être un mot de passe d’application Gmail valide.",
+      )
+      .optional(),
   ),
 
   EMAIL_FROM: z.preprocess(
@@ -80,13 +98,14 @@ if (result.data.NODE_ENV === "production") {
     )
   }
 
-  if (
-    !result.data.RESEND_API_KEY ||
-    !result.data.EMAIL_FROM ||
-    !result.data.APP_ORIGIN
-  ) {
+  const emailProviderConfigured =
+    result.data.EMAIL_PROVIDER === "gmail"
+      ? Boolean(result.data.GMAIL_USER && result.data.GMAIL_APP_PASSWORD)
+      : Boolean(result.data.RESEND_API_KEY && result.data.EMAIL_FROM)
+
+  if (!emailProviderConfigured || !result.data.APP_ORIGIN) {
     productionConfigurationErrors.push(
-      "RESEND_API_KEY, EMAIL_FROM et APP_ORIGIN sont requis pour les emails de sécurité.",
+      "Configurez le fournisseur email choisi et APP_ORIGIN pour les emails de sécurité.",
     )
   }
 
@@ -115,6 +134,18 @@ if (result.data.NODE_ENV === "production") {
       "JWT_SECRET doit être une clé aléatoire d’au moins 64 caractères.",
     )
   }
+}
+
+if (
+  result.data.JWT_SECRET.length < 64 ||
+  /^(replace-with|change-me|changeme|your[-_]|example)/i.test(
+    result.data.JWT_SECRET,
+  ) ||
+  new Set(result.data.JWT_SECRET).size < 16
+) {
+  throw new Error(
+    "JWT_SECRET doit être une clé aléatoire d’au moins 64 caractères et ne pas contenir de valeur par défaut.",
+  )
 }
 
 if (productionConfigurationErrors.length > 0) {

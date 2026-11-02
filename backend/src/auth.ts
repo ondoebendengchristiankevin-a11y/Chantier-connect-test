@@ -127,7 +127,9 @@ export async function authenticate(
   let userId: string
   let sessionVersion = 0
   try {
-    const payload = jwt.verify(token, config.JWT_SECRET)
+    const payload = jwt.verify(token, config.JWT_SECRET, {
+      algorithms: ["HS256"],
+    })
     if (typeof payload === "string" || typeof payload.sub !== "string") {
       response.status(401).json({ error: "Session invalide." })
       return
@@ -304,9 +306,15 @@ export async function authenticateUserById(userId: string): Promise<AuthUser | n
 
 export function issueSession(response: Response, user: AuthUser, rememberMe: boolean) {
   const lifetimeSeconds = rememberMe ? 7 * 24 * 60 * 60 : 12 * 60 * 60
-  const token = jwt.sign({ sub: user.id, sv: user.sessionVersion }, config.JWT_SECRET, {
-    expiresIn: lifetimeSeconds,
-  })
+  const token = jwt.sign(
+    { sub: user.id, sv: user.sessionVersion },
+    config.JWT_SECRET,
+    {
+      algorithm: "HS256",
+      expiresIn: lifetimeSeconds,
+      issuer: "chantier-connect",
+    },
+  )
   response.cookie(sessionCookie, token, {
     ...cookieOptions,
     maxAge: lifetimeSeconds * 1000,

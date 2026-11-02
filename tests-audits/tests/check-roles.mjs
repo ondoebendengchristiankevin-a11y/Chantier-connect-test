@@ -1,5 +1,7 @@
 import assert from "node:assert/strict"
 import { createHmac } from "node:crypto"
+import { readFile, writeFile } from "node:fs/promises"
+import path from "node:path"
 
 import "dotenv/config"
 
@@ -300,6 +302,43 @@ function currentTotpCode(secret) {
   return String(binary % 1_000_000).padStart(6, "0")
 }
 
+async function saveEditorTotpSecret(secret) {
+  const envPath = path.join(process.cwd(), ".env")
+  let contents
+
+  try {
+    contents = await readFile(envPath, "utf8")
+  } catch (error) {
+    throw new Error(
+      "Impossible d’enregistrer la clé MFA locale : le fichier .env racine doit déjà exister.",
+      { cause: error },
+    )
+  }
+
+  const lines = contents.split(/\r?\n/)
+  const variableIndex = lines.findIndex((line) =>
+    /^\s*CHECK_ROLES_EDITOR_TOTP_SECRET\s*=/.test(line),
+  )
+
+  if (variableIndex >= 0) {
+    const existingValue = lines[variableIndex].slice(
+      lines[variableIndex].indexOf("=") + 1,
+    )
+    assert.equal(
+      existingValue.trim(),
+      "",
+      "Une clé TOTP locale existe déjà dans .env; elle ne sera pas remplacée.",
+    )
+    lines[variableIndex] = `CHECK_ROLES_EDITOR_TOTP_SECRET=${secret}`
+    contents = lines.join("\n")
+  } else {
+    contents += `${contents.endsWith("\n") || contents.length === 0 ? "" : "\n"}CHECK_ROLES_EDITOR_TOTP_SECRET=${secret}\n`
+  }
+
+  await writeFile(envPath, contents, "utf8")
+  process.env.CHECK_ROLES_EDITOR_TOTP_SECRET = secret
+}
+
 async function login(email, password, expectedRole) {
   let { response, body } = await request("/api/auth/login", {
     method: "POST",
@@ -316,16 +355,50 @@ async function login(email, password, expectedRole) {
   )
 
   if (body.mfaSetupRequired) {
-    throw new Error(
-      "Le compte Éditeur doit terminer son enrôlement MFA sur /connexion avant la recette; ne configurez pas automatiquement une MFA à distance.",
+    assert.equal(expectedRole, "EDITOR")
+    assert.ok(
+      isLoopback &&
+        process.env.CHECK_ROLES_AUTO_ENROLL_EDITOR_MFA === "true",
+      "Le compte Éditeur doit terminer son enrôlement MFA. Pour un compte de recette local uniquement, définissez CHECK_ROLES_AUTO_ENROLL_EDITOR_MFA=true; le secret généré sera conservé dans le fichier .env racine.",
     )
+    const setup = await request("/api/auth/mfa/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ setupToken: body.setupToken }),
+    })
+    assert.equal(
+      setup.response.status,
+      200,
+      `Échec de l’initialisation MFA : ${JSON.stringify(setup.body)}`,
+    )
+    const secret = setup.body.data?.secret
+    assert.ok(
+      typeof secret === "string" && /^[A-Z2-7]+$/.test(secret),
+      "Le serveur a renvoyé une clé TOTP invalide.",
+    )
+    await saveEditorTotpSecret(secret)
+    const enabled = await request("/api/auth/mfa/enable", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        setupToken: body.setupToken,
+        code: currentTotpCode(secret),
+      }),
+    })
+    assert.equal(
+      enabled.response.status,
+      200,
+      `Échec de l’activation MFA : ${JSON.stringify(enabled.body)}`,
+    )
+    body = enabled.body
+    response = enabled.response
   }
   if (body.mfaRequired) {
     assert.equal(expectedRole, "EDITOR")
     const secret = process.env.CHECK_ROLES_EDITOR_TOTP_SECRET
     assert.ok(
       secret,
-      "Définissez CHECK_ROLES_EDITOR_TOTP_SECRET localement pour tester l’accès Éditeur MFA.",
+      "La clé MFA locale est absente. Définissez CHECK_ROLES_EDITOR_TOTP_SECRET ou utilisez une fois CHECK_ROLES_AUTO_ENROLL_EDITOR_MFA=true sur une cible locale.",
     )
     const verified = await request("/api/auth/mfa/verify", {
       method: "POST",

@@ -15,7 +15,10 @@ function loadProductionConfig({
   databaseSsl,
   jwtSecret,
   mfaEncryptionKey,
+  emailProvider = "resend",
   resendApiKey = "re_test_key",
+  gmailUser = "",
+  gmailAppPassword = "",
   emailFrom = "Chantier Connect <no-reply@example.com>",
   appOrigin = "https://app.example.com",
 }) {
@@ -42,7 +45,13 @@ function loadProductionConfig({
 
         MFA_ENCRYPTION_KEY: mfaEncryptionKey,
 
+        EMAIL_PROVIDER: emailProvider,
+
         RESEND_API_KEY: resendApiKey,
+
+        GMAIL_USER: gmailUser,
+
+        GMAIL_APP_PASSWORD: gmailAppPassword,
 
         EMAIL_FROM: emailFrom,
 
@@ -151,6 +160,7 @@ const missingEmailConfiguration = loadProductionConfig({
   databaseSsl: "true",
   jwtSecret: secureSecret,
   mfaEncryptionKey: secureMfaKey,
+  emailProvider: "resend",
   resendApiKey: "",
   emailFrom: "",
   appOrigin: "",
@@ -171,6 +181,54 @@ assert.notEqual(
   insecureAppOrigin.status,
   0,
   "La production doit refuser une origine frontend sans HTTPS.",
+)
+
+const validGmail = loadProductionConfig({
+  databaseSsl: "true",
+  jwtSecret: secureSecret,
+  mfaEncryptionKey: secureMfaKey,
+  emailProvider: "gmail",
+  resendApiKey: "",
+  gmailUser: "recette@example.com",
+  gmailAppPassword: "abcd efgh ijkl mnop",
+  emailFrom: "",
+})
+assert.equal(
+  validGmail.status,
+  0,
+  "Une configuration Gmail avec mot de passe d’application doit être acceptée.",
+)
+
+const missingGmailAppPassword = loadProductionConfig({
+  databaseSsl: "true",
+  jwtSecret: secureSecret,
+  mfaEncryptionKey: secureMfaKey,
+  emailProvider: "gmail",
+  resendApiKey: "",
+  gmailUser: "recette@example.com",
+  gmailAppPassword: "",
+  emailFrom: "",
+})
+assert.notEqual(
+  missingGmailAppPassword.status,
+  0,
+  "La production doit refuser Gmail sans mot de passe d’application.",
+)
+
+const malformedGmailAppPassword = loadProductionConfig({
+  databaseSsl: "true",
+  jwtSecret: secureSecret,
+  mfaEncryptionKey: secureMfaKey,
+  emailProvider: "gmail",
+  resendApiKey: "",
+  gmailUser: "recette@example.com",
+  gmailAppPassword: "too-short",
+  emailFrom: "",
+})
+assert.notEqual(
+  malformedGmailAppPassword.status,
+  0,
+  "La production doit refuser un mot de passe d’application Gmail mal formé.",
 )
 
 const manifest = JSON.parse(

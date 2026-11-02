@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto"
 import type { Request } from "express"
 import type { UserRole } from "./types.js"
 import { pool } from "./db.js"
+import { config } from "./config.js"
 import { maskEmail } from "./privacy.js"
 import { writeAuditLog } from "./audit-log.js"
 import { sendPasswordResetEmail } from "./mailer.js"
@@ -60,7 +61,11 @@ export async function issuePasswordReset(input: {
       token,
     })
     return true
-  } catch {
+  } catch (error) {
+    console.error("Échec d’envoi d’un email de sécurité.", {
+      provider: config.EMAIL_PROVIDER,
+      errorName: error instanceof Error ? error.name : "UnknownError",
+    })
     const failureClient = await pool.connect()
     try {
       await failureClient.query("BEGIN")

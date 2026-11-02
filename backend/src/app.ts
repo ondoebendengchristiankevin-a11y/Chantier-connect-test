@@ -1,6 +1,10 @@
 import express, { type ErrorRequestHandler } from "express"
 
+import cors from "cors"
+
 import helmet from "helmet"
+
+import { rateLimit } from "express-rate-limit"
 
 import { ZodError } from "zod"
 
@@ -26,11 +30,55 @@ import workRoutes from "./routes/work.js"
 
 const app = express()
 
+const allowedOrigins = new Set(
+  [
+    config.APP_ORIGIN,
+    "http://localhost:8443",
+    "http://127.0.0.1:8443",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+  ].filter((value): value is string => Boolean(value)),
+)
+
+const appCors = cors({
+  origin(origin: string | undefined, callback: (error: Error | null, allow?: boolean) => void) {
+    if (!origin || allowedOrigins.has(origin)) {
+      callback(null, true)
+      return
+    }
+
+    callback(new Error("Origine non autorisée pour cette API."))
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  maxAge: 600,
+})
+
 if (config.NODE_ENV === "production") app.set("trust proxy", 1)
 
 app.disable("x-powered-by")
 
-app.use(helmet())
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  referrerPolicy: { policy: "no-referrer" },
+}))
+
+app.use(appCors)
+
+app.options(/.*/, appCors)
+
+app.use(
+  "/api/auth",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 60,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    skipSuccessfulRequests: true,
+    message: { error: "Trop de demandes d’authentification. Réessayez dans 15 minutes." },
+  }),
+)
 
 app.use(express.json({ limit: "4mb" }))
 

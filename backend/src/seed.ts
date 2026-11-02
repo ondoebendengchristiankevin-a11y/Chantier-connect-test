@@ -263,6 +263,16 @@ async function seed() {
       [tenantId],
     )
 
+    await client.query(
+      `INSERT INTO tenant_subscriptions (tenant_id, plan_id, status, renews_at)
+       SELECT $1, id, 'Actif', CURRENT_DATE + 30
+       FROM subscription_plans WHERE name = 'Plan PME'
+       ON CONFLICT (tenant_id) DO UPDATE SET
+         plan_id = EXCLUDED.plan_id, status = EXCLUDED.status,
+         renews_at = EXCLUDED.renews_at, updated_at = now()`,
+      [tenantId],
+    )
+
     for (const user of users) {
       await client.query(
         `INSERT INTO users (

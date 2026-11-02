@@ -18,6 +18,7 @@ import type { AuthenticatedRequest } from "../types.js"
 
 import { getPlatformRequestLimit } from "../platform-settings.js"
 import { tenantStorageCapacity } from "../storage.js"
+import { isSecurityEmailConfigured } from "../mailer.js"
 
 import {
   authenticate,
@@ -124,7 +125,7 @@ router.post("/password-reset/request", passwordResetLimiter, async (request, res
     response.status(400).json({ error: "Adresse email invalide." })
     return
   }
-  if (config.RESEND_API_KEY && config.EMAIL_FROM && config.APP_ORIGIN) {
+  if (isSecurityEmailConfigured()) {
     const result = await pool.query<{
       id: string; email: string; full_name: string; role: string; tenant_id: string | null
     }>(

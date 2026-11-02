@@ -17,7 +17,7 @@ Copiez `.env.example` vers `.env` en développement et renseignez :
   et conservez-la dans le gestionnaire de secrets de l’hébergeur. Sa perte rend
   les secrets TOTP stockés irrécupérables; sa rotation nécessite une procédure
   dédiée avant de remplacer la clé.
-- `RESEND_API_KEY`, `EMAIL_FROM` et `APP_ORIGIN` : configuration facultative en développement, mais obligatoire en production pour les emails de récupération et d’invitation Éditeur. `EMAIL_FROM` doit être une adresse/domaine validé par Resend et `APP_ORIGIN` l’origine HTTPS publique du frontend.
+- `EMAIL_PROVIDER` : `gmail` ou `resend`. Pour Gmail, configurez `GMAIL_USER` et un mot de passe d’application Google de 16 caractères dans le gestionnaire de secrets; pour Resend, configurez `RESEND_API_KEY` et `EMAIL_FROM` avec une adresse/domaine validé. Dans les deux cas, `APP_ORIGIN` doit être l’origine HTTPS publique du frontend. Cette configuration sert aux liens de réinitialisation de mot de passe et aux emails d’invitation/récupération Éditeur; elle n’active pas de codes OTP par email. Le MFA Éditeur utilise une application TOTP.
 - `NODE_ENV=production` et `PORT` (le port fourni par l’hébergeur).
 
 Ne commitez jamais `.env`, et ne lancez pas les données de démonstration en production.
@@ -30,9 +30,9 @@ Ne commitez jamais `.env`, et ne lancez pas les données de démonstration en pr
 - Démarrage : `npm start`
 - Health check : `/api/health`
 
-Configurez les variables runtime dans le gestionnaire de secrets de l’hébergeur. Appliquez les migrations SQL de `migrations/` à Supabase une seule fois, dans l’ordre numérique, avant d’ouvrir l’API au public. `npm run migrate` utilise `DATABASE_URL` et `DATABASE_SSL`; vérifiez d’abord l’impact des migrations sur une base de recette. N’exécutez jamais `npm run seed` en production.
+Configurez les variables runtime dans le gestionnaire de secrets de l’hébergeur. Appliquez les migrations SQL de `migrations/` à Supabase une seule fois, dans l’ordre numérique, avant d’ouvrir l’API au public. `npm run migrate` utilise `DATABASE_URL` et `DATABASE_SSL`; vérifiez d’abord la cible, puis appliquez les migrations d’abord à une base de préproduction distincte. N’exécutez jamais `npm run seed` en production.
 
-La migration `010_platform_administration.sql` ajoute les journaux d’audit, les jetons de réinitialisation, le consentement aux accès support et les clés d’affectation chantier. Son script de retour arrière est dans `migrations/rollback/010_platform_administration.sql`; il est manuel et doit être évalué avant exécution, car les états « Archivé » sont ramenés aux états disponibles dans l’ancienne version. Sans les variables Resend, la demande publique de réinitialisation garde une réponse générique anti-énumération mais aucun email n’est transmis; configurez les trois variables pour activer ce parcours.
+La migration `010_platform_administration.sql` ajoute les journaux d’audit, les jetons de réinitialisation, le consentement aux accès support et les clés d’affectation chantier. Son script de retour arrière est dans `migrations/rollback/010_platform_administration.sql`; il est manuel et doit être évalué avant exécution, car les états « Archivé » sont ramenés aux états disponibles dans l’ancienne version. Sans fournisseur email correctement configuré, la demande publique de réinitialisation garde une réponse générique anti-énumération mais aucun email n’est transmis; configurez les variables du fournisseur choisi et `APP_ORIGIN` pour activer ce parcours.
 
 La migration `012_site_project_details.sql` enrichit les chantiers avec leur description, leur ville/province, le maître d’ouvrage, la nature des travaux, la référence du marché et le délai prévu. Appliquez-la avant de déployer la version API qui enregistre ces informations.
 
@@ -62,6 +62,8 @@ npm run dev
 ```
 
 Le serveur écoute sur `PORT` (3001 par défaut). Pour utiliser le frontend local, démarrez-le séparément ; son proxy Vite cible `http://127.0.0.1:3001` par défaut.
+
+Pour préparer les comptes de démonstration, définissez `DEMO_SEED_PASSWORD` puis lancez `npm run seed` uniquement sur une base locale de recette. Le seed réinitialise les mots de passe des comptes de démonstration et renouvelle l’abonnement du tenant démo pour 30 jours. Ne l’exécutez jamais en production.
 
 ## Dépôt indépendant
 

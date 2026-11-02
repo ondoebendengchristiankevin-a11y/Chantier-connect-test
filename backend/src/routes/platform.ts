@@ -19,6 +19,7 @@ import { roleAccess } from "../role-access.js"
 import { writeAuditLog } from "../audit-log.js"
 
 import { issuePasswordReset } from "../password-reset.js"
+import { isSecurityEmailConfigured } from "../mailer.js"
 
 import platformUsersRouter from "./platform-users.js"
 
@@ -41,7 +42,7 @@ router.post("/editors", async (request, response) => {
     response.status(400).json({ error: "Nom ou email de l’éditeur invalide." })
     return
   }
-  if (!config.RESEND_API_KEY || !config.EMAIL_FROM || !config.APP_ORIGIN) {
+  if (!isSecurityEmailConfigured()) {
     response.status(503).json({
       error: "Configurez l’envoi des emails de sécurité avant d’inviter un éditeur.",
     })
