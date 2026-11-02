@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: chantier-connect-preproduction
+    runtime: node
+    rootDir: backend
+    branch: preproduction
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: false
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_SSL
+        value: "true"
+      - key: EMAIL_PROVIDER
+        value: gmail
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: MFA_ENCRYPTION_KEY
+        sync: false
+      - key: GMAIL_USER
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: APP_ORIGIN
+        sync: false
